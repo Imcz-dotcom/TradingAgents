@@ -41,15 +41,22 @@ dev = [
 bedrock = [
     "langchain-aws>=1.7.9",
 ]
+# Execution agent: Moomoo broker + Telegram approval. Optional so the core
+# install stays lean: pip install "tradingagents[execution]".
+execution = [
+    "moomoo-api",
+    "python-telegram-bot>=21",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"
+tradingagents-execution = "execution_agent.main:app"
 
 [tool.setuptools.dynamic]
 version = {attr = "tradingagents.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingagents*", "cli*", "execution_agent*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]

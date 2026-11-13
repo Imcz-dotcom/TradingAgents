@@ -1,0 +1,5 @@
+# Extra dependencies for the execution agent, on top of the TradingAgents base
+# install. Declared here for reference; also exposed as the [execution] optional
+# extra in pyproject.toml (pip install -e ".[execution]").
+moomoo-api
+python-telegram-bot>=21
