@@ -1,6 +1,8 @@
 """Persistent serve bot: command parsing and the research/execute/chat loop."""
 
 import asyncio
+import json
+from datetime import date
 
 import pytest
 
@@ -142,6 +144,32 @@ def _decision():
     )
 
 
+def _entry(
+    yahoo="NVDA",
+    moomoo="US.NVDA",
+    signal="Buy",
+    side="BUY",
+    summary="Strong momentum.",
+    executed=False,
+    research=None,
+):
+    """A persisted research entry in the day format, matching _research_to_entry."""
+    return {
+        "executed": executed,
+        "decision": {
+            "yahoo": yahoo,
+            "moomoo": moomoo,
+            "signal": signal,
+            "side": side,
+            "summary": summary,
+            "cash": None,
+            "position_quantity": None,
+            "research": research
+            or {"final_trade_decision": "Buy NVDA", "market_report": "solid"},
+        },
+    }
+
+
 class FakeNotifier:
     """Returns scripted replies in order, then breaks the loop with "stop"."""
 
@@ -160,7 +188,10 @@ class FakeNotifier:
         pass
 
     async def watch_for_cancel(self, cancelled):
-        pass
+        # No stop arrives: block until cancelled, like the real watcher with no
+        # incoming messages. (Returning immediately would read as "stop seen".)
+        while True:
+            await asyncio.sleep(1)
 
     async def ask_button(self, prompt, buttons, timeout_seconds):
         self.confirmations.append((prompt, [b for b, _ in buttons]))
@@ -181,6 +212,8 @@ def _wire(monkeypatch, tmp_path, notifier_cls):
     monkeypatch.setattr(serve_mod, "TradingAgentsGraph", FakeGraph)
     monkeypatch.setattr(serve_mod, "run_decision_streaming", lambda *a, **k: _decision())
     monkeypatch.setattr(state_mod, "audit_path", lambda: str(tmp_path / "audit.jsonl"))
+    # Persistence writes to the test tmp dir, never the real ~/.tradingagents.
+    monkeypatch.setattr(serve_mod.persist, "history_path", lambda: str(tmp_path / "research_history.json"))
 
 
 def _config():
@@ -324,6 +357,93 @@ def test_serve_loop_chat_without_research_nudges(monkeypatch, tmp_path):
     assert any("No research yet" in s for s in ChatOnlyNotifier.instances[0].sent)
 
 
+def test_serve_loop_restores_todays_research_on_startup(monkeypatch, tmp_path):
+    """A restart within the same day reloads the saved research for /chat."""
+    day = {
+        "date": date.today().isoformat(),
+        "researches": {"NVDA": _entry()},
+        "chat_history": [],
+    }
+    (tmp_path / "research_history.json").write_text(json.dumps(day))
+
+    monkeypatch.setattr(serve_mod.chat, "answer", lambda *a, **k: "The biggest risk is concentration.")
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class ChatOnlyNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/chat what's the risk?",))
+
+    _wire(monkeypatch, tmp_path, ChatOnlyNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    sent = ChatOnlyNotifier.instances[0].sent
+    assert any("biggest risk is concentration" in s for s in sent)
+    assert not any("No research yet" in s for s in sent)
+
+
+def test_serve_loop_restores_all_tickers_and_chat_from_today(monkeypatch, tmp_path):
+    """A restart reloads every ticker and the chat history, not just the last one."""
+    day = {
+        "date": date.today().isoformat(),
+        "researches": {
+            "NVDA": _entry(yahoo="NVDA", moomoo="US.NVDA"),
+            "INTC": _entry(yahoo="INTC", moomoo="US.INTC", summary="Chip play."),
+        },
+        "chat_history": [{"ticker": "NVDA", "q": "risk?", "a": "concentration"}],
+    }
+    (tmp_path / "research_history.json").write_text(json.dumps(day))
+
+    answers = []
+
+    def fake_answer(final_state, ticker, history, question):
+        answers.append((ticker, list(history), question))
+        return "got it"
+
+    monkeypatch.setattr(serve_mod.chat, "answer", fake_answer)
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class ChatNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/chat INTC what now?",))
+
+    _wire(monkeypatch, tmp_path, ChatNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    # Both tickers were restored; /chat targeted INTC and carried the old history.
+    assert answers[0][0] == "INTC"
+    assert answers[0][1] == [{"ticker": "NVDA", "q": "risk?", "a": "concentration"}]
+    assert answers[0][2] == "what now?"
+    # The chat answer still goes out.
+    assert any("got it" in s for s in ChatNotifier.instances[0].sent)
+
+
+def test_serve_loop_ignores_stale_memory_from_previous_day(monkeypatch, tmp_path):
+    """Memory from an earlier day is not restored — a new day starts fresh."""
+    day = {
+        "date": "2000-01-01",
+        "researches": {"NVDA": _entry(summary="Old.")},
+        "chat_history": [],
+    }
+    (tmp_path / "research_history.json").write_text(json.dumps(day))
+
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class ChatOnlyNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/chat hello",))
+
+    _wire(monkeypatch, tmp_path, ChatOnlyNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert any("No research yet" in s for s in ChatOnlyNotifier.instances[0].sent)
+
+
 def test_serve_loop_drains_stale_updates_before_listening(monkeypatch, tmp_path):
     """A restart must drop pending messages first, not replay an old ticker."""
     class TrackingNotifier(FakeNotifier):
@@ -448,3 +568,148 @@ def test_serve_loop_stop_during_research_cancels(monkeypatch, tmp_path):
     # No approval flow ran — the run was cancelled before any order was proposed.
     assert placed == []
     assert any("Stopped" in s for s in StopDuringResearchNotifier.instances[0].sent)
+
+
+# ---- resolve_chat_target ---------------------------------------------------
+
+
+def test_resolve_chat_target_leading_ticker():
+    researches = {"NVDA": object(), "INTC": object()}
+    assert serve_mod.resolve_chat_target("NVDA what's the risk?", researches) == (
+        "NVDA",
+        "what's the risk?",
+    )
+
+
+def test_resolve_chat_target_named_anywhere():
+    researches = {"NVDA": object(), "INTC": object()}
+    assert serve_mod.resolve_chat_target("compare it to intc", researches) == (
+        "INTC",
+        "compare it to intc",
+    )
+
+
+def test_resolve_chat_target_defaults_to_latest():
+    researches = {"NVDA": object(), "INTC": object()}
+    assert serve_mod.resolve_chat_target("what's the risk?", researches) == (
+        "INTC",
+        "what's the risk?",
+    )
+
+
+def test_resolve_chat_target_empty():
+    assert serve_mod.resolve_chat_target("anything", {}) == (None, "anything")
+
+
+# ---- multi-ticker day ------------------------------------------------------
+
+
+def _decision_for(ticker):
+    return DecisionResult(
+        yahoo=ticker,
+        moomoo=f"US.{ticker}",
+        signal="Buy",
+        side="BUY",
+        summary=f"Buy {ticker}.",
+        cash=None,
+        position_quantity=None,
+        research={"final_trade_decision": f"Buy {ticker}"},
+    )
+
+
+def test_serve_loop_keeps_multiple_tickers_and_executes_latest(monkeypatch, tmp_path):
+    """Researching NVDA then INTC keeps both; /execute trades the latest (INTC)."""
+    placed = []
+
+    async def fake_approve_and_place(notifier, config, decision, audit, dry_run, trading_env=None):
+        placed.append(decision.yahoo)
+        return "✅ Order placed: 123 (SUBMITTED)"
+
+    monkeypatch.setattr(serve_mod, "approve_and_place", fake_approve_and_place)
+
+    class TwoTickersNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("NVDA", "INTC", "/execute"))
+
+    _wire(monkeypatch, tmp_path, TwoTickersNotifier)
+    monkeypatch.setattr(
+        serve_mod, "run_decision_streaming", lambda graph, ticker, *a, **k: _decision_for(ticker)
+    )
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert placed == ["INTC"]  # latest wins
+    sent = TwoTickersNotifier.instances[0].sent
+    assert any("TradingAgents says BUY NVDA" in s for s in sent)
+    assert any("TradingAgents says BUY INTC" in s for s in sent)
+
+
+def test_serve_loop_chat_targets_named_ticker(monkeypatch, tmp_path):
+    """``/chat NVDA ...`` answers from NVDA even after INTC is the latest."""
+    targets = []
+
+    def fake_answer(final_state, ticker, history, question):
+        targets.append(ticker)
+        return f"answered for {ticker}"
+
+    monkeypatch.setattr(serve_mod.chat, "answer", fake_answer)
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class NamedChatNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("NVDA", "INTC", "/chat NVDA what's the risk?"))
+
+    _wire(monkeypatch, tmp_path, NamedChatNotifier)
+    monkeypatch.setattr(
+        serve_mod, "run_decision_streaming", lambda graph, ticker, *a, **k: _decision_for(ticker)
+    )
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert targets == ["NVDA"]
+
+
+def test_serve_loop_drops_raw_messages_from_in_memory_research(monkeypatch, tmp_path):
+    """The raw agent ``messages`` are dead weight in RAM; /chat sees only the subset."""
+    seen = []
+
+    def fake_answer(final_state, ticker, history, question):
+        seen.append(final_state)
+        return "ok"
+
+    def decision_with_messages():
+        d = _decision()
+        return DecisionResult(
+            yahoo=d.yahoo,
+            moomoo=d.moomoo,
+            signal=d.signal,
+            side=d.side,
+            summary=d.summary,
+            cash=d.cash,
+            position_quantity=d.position_quantity,
+            research={
+                "final_trade_decision": "Buy NVDA",
+                "market_report": "solid",
+                "messages": ["raw agent chatter"],
+            },
+        )
+
+    monkeypatch.setattr(serve_mod.chat, "answer", fake_answer)
+    monkeypatch.setattr(
+        serve_mod, "run_decision_streaming", lambda graph, ticker, *a, **k: decision_with_messages()
+    )
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class ChatNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("NVDA", "/chat what's the risk?"))
+
+    _wire(monkeypatch, tmp_path, ChatNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert seen and "messages" not in seen[0]
+    assert "market_report" in seen[0]

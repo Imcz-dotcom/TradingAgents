@@ -4,12 +4,14 @@ Run ``czagent serve`` and leave the laptop running. From your phone you can:
 
   ``NVDA`` / ``/research NVDA`` — run the research, store the full result, and
                                   send the summary + AI's Buy/Sell. No order.
-  ``/execute``               — run the approval flow on the last research
-                                  (direction -> amount -> dollars/shares ->
-                                  Approve/Reject), exactly like ``run``.
-  ``/chat <question>``       — ask a question about the last research (the bot
+  ``/execute``               — run the approval flow on the latest research of
+                                  the day (direction -> amount -> dollars/shares
+                                  -> Approve/Reject), exactly like ``run``.
+  ``/chat <question>``       — ask a question about today's research (the bot
                                   answers from the full reports/debates, not the
-                                  one-line summary). Multi-turn.
+                                  one-line summary). Multi-turn, remembers the
+                                  whole day's conversation, and can target any
+                                  ticker researched today: ``/chat NVDA ...``.
   ``/mode`` / ``/mode paper`` / ``/mode real`` — show or switch paper/live.
   ``stop``                   — abort whatever the bot is waiting on.
 
@@ -23,12 +25,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, replace
 from datetime import date
 
 import typer
 
-from execution_agent import chat, cleanup, state
+from execution_agent import chat, cleanup, persist, state
 from execution_agent.config import ExecutionConfig, mode_label
 from execution_agent.decision import DecisionResult, run_decision_streaming
 from execution_agent.main import TELEGRAM_MAX_CHARS, _fit_telegram, approve_and_place
@@ -45,25 +48,27 @@ _COMMAND_RE = re.compile(
 # "/mode", "/mode paper", "/mode real" — query or switch the trading environment.
 _MODE_RE = re.compile(r"^\s*/mode\b\s*(?P<arg>paper|real)?\s*$", re.IGNORECASE)
 
-# "/execute" — run the approval flow on the last stored research.
+# "/execute" — run the approval flow on the latest stored research.
 _EXECUTE_RE = re.compile(r"^\s*/execute\b", re.IGNORECASE)
 
-# "/chat <question>" — ask about the last stored research.
+# "/chat <question>" — ask about today's research; an optional leading ticker
+# ("/chat NVDA ...") targets that run instead of the latest one.
 _CHAT_RE = re.compile(r"^\s*/chat\b\s*(?P<question>.*)$", re.IGNORECASE)
 
 # A "fresh"/"force" hint after a ticker forces a re-run even though the same
 # ticker was already researched today (the default is to reuse the stored run).
 _FRESH_RE = re.compile(r"\b(?:fresh|force|refresh|re-?run)\b", re.IGNORECASE)
 
+# A leading ticker token in a /chat message, e.g. "/chat NVDA what's the risk?"
+_TICKER_LEAD = re.compile(r"^\s*([A-Za-z0-9.]+)\s*(.*)$", re.DOTALL)
+
 
 @dataclass
 class _Research:
-    """The last completed research run, held in memory for /execute and /chat."""
+    """One completed research run on a ticker, held for /execute and /chat."""
 
     ticker: str
-    date: str
     decision: DecisionResult  # carries .research = the full final state
-    chat_history: list[tuple[str, str]] = field(default_factory=list)
     executed: bool = False
 
 
@@ -122,6 +127,103 @@ def _research_summary(decision: DecisionResult, trading_env: str) -> str:
     return header + summary + footer
 
 
+def resolve_chat_target(question: str, researches: dict) -> tuple[str | None, str]:
+    """Pick which research a ``/chat`` question is about.
+
+    - A leading ticker token (``/chat NVDA ...``) targets that ticker.
+    - Otherwise, any researched ticker named anywhere in the question wins.
+    - Otherwise, the latest research (last inserted) is assumed.
+
+    Returns ``(ticker, remaining_question)``; ``ticker`` is None when there is
+    no research yet.
+    """
+    if not researches:
+        return None, question
+    q = (question or "").strip()
+    m = _TICKER_LEAD.match(q)
+    if m:
+        lead = m.group(1)
+        for t in researches:
+            if t.upper() == lead.upper():
+                return t, m.group(2).strip()
+    for t in researches:
+        if re.search(rf"\b{re.escape(t)}\b", q, re.IGNORECASE):
+            return t, q
+    return next(reversed(researches)), q
+
+
+def _research_to_entry(res: _Research) -> dict:
+    """Serialize one research run to a plain JSON-safe dict."""
+    d = res.decision
+    return {
+        "executed": res.executed,
+        "decision": {
+            "yahoo": d.yahoo,
+            "moomoo": d.moomoo,
+            "signal": d.signal,
+            "side": d.side,
+            "summary": d.summary,
+            "cash": d.cash,
+            "position_quantity": d.position_quantity,
+            "research": persist.research_subset(d.research),
+        },
+    }
+
+
+def _entry_to_research(ticker: str, entry: dict) -> _Research | None:
+    """Rebuild a ``_Research`` from a persisted entry, or None if malformed."""
+    try:
+        d = entry["decision"]
+        decision = DecisionResult(
+            yahoo=d["yahoo"],
+            moomoo=d["moomoo"],
+            signal=d["signal"],
+            side=d["side"],
+            summary=d.get("summary", ""),
+            cash=d.get("cash"),
+            position_quantity=d.get("position_quantity"),
+            research=d.get("research") or {},
+        )
+        return _Research(ticker=ticker, decision=decision, executed=entry.get("executed", False))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _day_to_history(researches: dict, chat_history: list) -> dict:
+    """Serialize the whole day — every research run and chat turn — to a dict."""
+    return {
+        "date": date.today().isoformat(),
+        "researches": {t: _research_to_entry(r) for t, r in researches.items()},
+        "chat_history": chat_history,
+    }
+
+
+def _history_to_day(day: dict) -> tuple[dict, list]:
+    """Rebuild ``(researches, chat_history)`` from a persisted day; best-effort.
+
+    Malformed entries are dropped rather than failing the whole restore, so a
+    single bad record never loses the rest of the day.
+    """
+    if not isinstance(day, dict):
+        return {}, []
+    raw = day.get("researches") or {}
+    researches: dict = {}
+    if isinstance(raw, dict):
+        for ticker, entry in raw.items():
+            if not isinstance(ticker, str) or not isinstance(entry, dict):
+                continue
+            res = _entry_to_research(ticker, entry)
+            if res is not None:
+                researches[ticker] = res
+    chat_history: list = []
+    for entry in day.get("chat_history") or []:
+        if isinstance(entry, dict) and entry.get("q"):
+            chat_history.append(
+                {"ticker": entry.get("ticker"), "q": entry["q"], "a": entry.get("a", "")}
+            )
+    return researches, chat_history
+
+
 async def serve_loop(config: ExecutionConfig) -> None:
     """Listen for commands and drive research / execute / chat, forever."""
     audit = state.audit_path()
@@ -169,17 +271,33 @@ async def serve_loop(config: ExecutionConfig) -> None:
         if removed:
             typer.echo(f"🧹 Removed {removed} stale log file(s) older than a week.")
 
-    research: _Research | None = None
+    # The day's state: every ticker researched today (insertion-ordered, so the
+    # last one is "latest"), plus the whole day's /chat conversation.
+    researches: dict[str, _Research] = {}
+    chat_history: list[dict] = []
+
+    def save_day() -> None:
+        """Persist the day to disk for same-day restarts."""
+        with contextlib.suppress(Exception):
+            persist.save_history(_day_to_history(researches, chat_history))
+
+    # Restore today's history from an earlier session, so /chat and /execute
+    # survive a restart within the same day. A new day starts fresh (the stored
+    # date no longer matches today) — that is the "per-day" memory.
+    loaded = persist.load_history()
+    if isinstance(loaded, dict) and loaded.get("date") == date.today().isoformat():
+        researches, chat_history = _history_to_day(loaded)
+        if researches:
+            typer.echo(f"📚 Restored today's research on {', '.join(researches)}.")
 
     async def handle_research(ticker: str, fresh: bool = False) -> None:
-        nonlocal research
         today = date.today().isoformat()
-        # Same ticker on the same trading day: reuse the research already held in
-        # memory instead of paying for another full pipeline run. The data is keyed
-        # by date, so a re-run later the same day would read the same inputs; the
-        # only way it changes is a fresh run (forced with "/research NVDA fresh").
-        if not fresh and research is not None and research.ticker == ticker and research.date == today:
-            d = research.decision
+        # Same ticker today: reuse the research already held instead of paying for
+        # another full pipeline run. The data is keyed by date, so a re-run later
+        # the same day would read the same inputs; the only way it changes is a
+        # fresh run (forced with "/research NVDA fresh").
+        if not fresh and ticker in researches:
+            d = researches[ticker].decision
             call = f"{d.side} {d.yahoo}" if d.side else f"no order on {d.yahoo}"
             typer.echo(f"📚 {ticker}: reuse today's research — not re-running.")
             await notifier.send(
@@ -195,32 +313,60 @@ async def serve_loop(config: ExecutionConfig) -> None:
             typer.echo(f"⚠️ Couldn't reply on Telegram: {exc}", err=True)
         try:
             graph = TradingAgentsGraph(debug=False, config=DEFAULT_CONFIG.copy())
-            # Watch for "stop" while research runs (it can take a minute or two),
-            # so a cancel is acked immediately instead of sitting unread until
-            # the run finishes and then being dropped.
-            cancelled = asyncio.Event()
-            watch = asyncio.create_task(notifier.watch_for_cancel(cancelled))
+            # A "stop" during research is caught on two fronts: the watcher polls
+            # Telegram and sets ``stopped`` the moment a stop lands, and the
+            # research itself checks ``stopped`` between phases so it aborts at
+            # the next phase boundary instead of running the full pipeline.
+            stopped = threading.Event()
+            watch = asyncio.create_task(notifier.watch_for_cancel(stopped))
             await asyncio.sleep(0)  # let the watcher start polling before research begins
-            try:
-                decision = await asyncio.to_thread(
-                    run_decision_streaming, graph, ticker, today, config=config, on_step=_on_step
+            runner = asyncio.create_task(
+                asyncio.to_thread(
+                    run_decision_streaming,
+                    graph,
+                    ticker,
+                    today,
+                    config=config,
+                    on_step=_on_step,
+                    stop_check=stopped.is_set,
                 )
+            )
+            try:
+                await asyncio.wait({runner, watch}, return_when=asyncio.FIRST_COMPLETED)
             finally:
                 watch.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await watch
 
-            if cancelled.is_set():
+            if stopped.is_set():
+                # Stop arrived (or the run is still mid-phase): ack now and
+                # abandon the run instead of waiting for it to finish.
+                runner.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await runner
                 typer.echo(f"🛑 {ticker}: stopped during research — no order.")
                 await notifier.send("🛑 Stopped — no order placed.")
                 state.append_event(audit, {"event": "skip", "reason": "stopped_during_research"})
                 return
 
+            decision = runner.result()
             state.append_event(
                 audit,
                 {"event": "decision", "ticker": ticker, "signal": decision.signal, "side": decision.side},
             )
-            research = _Research(ticker=ticker, date=today, decision=decision)
+            # Re-researching a ticker moves it to the end, so "latest" always
+            # means the run you just did.
+            if ticker in researches:
+                del researches[ticker]
+            # Keep only the JSON-safe subset in RAM. The full final state (with
+            # the raw agent ``messages``) is already archived to disk by
+            # ``record_decision`` inside run_decision_streaming; /chat and
+            # /execute only ever read the subset, so the messages are dead weight.
+            researches[ticker] = _Research(
+                ticker=ticker,
+                decision=replace(decision, research=persist.research_subset(decision.research)),
+            )
+            save_day()
 
             if decision.side is None:
                 await notifier.send(
@@ -240,10 +386,11 @@ async def serve_loop(config: ExecutionConfig) -> None:
             await notifier.send(f"❌ {exc}")
 
     async def handle_execute() -> None:
-        res = research
-        if res is None:
+        if not researches:
             await notifier.send("No research yet — send a ticker or `/research NVDA` first.")
             return
+        ticker = next(reversed(researches))  # the latest research of the day
+        res = researches[ticker]
         if res.decision.side is None:
             await notifier.send(
                 f"No trade for {res.decision.yahoo}: {res.decision.signal}. `/chat` to ask about it."
@@ -251,7 +398,7 @@ async def serve_loop(config: ExecutionConfig) -> None:
             return
         if res.executed:
             await notifier.send(
-                f"{res.ticker} was already executed — send `/research {res.ticker}` for a fresh decision."
+                f"{ticker} was already executed — send `/research {ticker}` for a fresh decision."
             )
             return
         summary = await approve_and_place(
@@ -259,26 +406,32 @@ async def serve_loop(config: ExecutionConfig) -> None:
         )
         if summary.startswith("✅ Order placed"):
             res.executed = True
+            save_day()
         await notifier.send(summary or "Cancelled — no order placed.")
-        typer.echo(f"Done with {res.ticker}: {summary or 'no order'} — listening again.")
+        typer.echo(f"Done with {ticker}: {summary or 'no order'} — listening again.")
 
     async def handle_chat(question: str) -> None:
-        res = research
-        if res is None:
+        if not researches:
             await notifier.send("No research yet — send a ticker or `/research NVDA` first.")
             return
+        ticker, question = resolve_chat_target(question, researches)
         if not question:
-            await notifier.send("Ask a question about the research, e.g. `/chat what's the biggest risk?`")
+            await notifier.send(
+                "Ask a question about the research, e.g. `/chat what's the biggest risk?` "
+                "— or name a ticker: `/chat NVDA what's the risk?`"
+            )
             return
-        typer.echo(f"💬 {res.ticker}: answering — {question}")
+        res = researches[ticker]
+        typer.echo(f"💬 {ticker}: answering — {question}")
         try:
             answer = await asyncio.to_thread(
-                chat.answer, res.decision.research, res.ticker, res.chat_history, question
+                chat.answer, res.decision.research, ticker, chat_history, question
             )
         except Exception as exc:  # noqa: BLE001 — a chat failure must not kill the bot
             await notifier.send(f"❌ Chat failed: {exc}")
             return
-        res.chat_history.append((question, answer))
+        chat_history.append({"ticker": ticker, "q": question, "a": answer})
+        save_day()
         await notifier.send(_fit_telegram(answer))
 
     while True:

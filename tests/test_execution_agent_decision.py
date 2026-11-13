@@ -304,3 +304,35 @@ def test_run_decision_streaming_skips_empty_debate_state():
 
     assert labels == ["✅ Final decision reached"]
     assert decision.side is None  # Hold has no side
+
+
+def test_run_decision_streaming_stops_immediately_when_checked():
+    graph = FakeStreamingGraph([
+        ([], {"market_report": "Market is up."}),
+        ([], {"final_trade_decision": "Rating: Buy", "final_rating": "Buy"}),
+    ])
+
+    decision = run_decision_streaming(
+        graph, "NVDA", "2026-11-12", config=ExecutionConfig(), stop_check=lambda: True
+    )
+
+    assert decision is None  # aborted before the first chunk was processed
+
+
+def test_run_decision_streaming_stops_at_next_phase_boundary():
+    graph = FakeStreamingGraph([
+        ([], {"market_report": "Market is up."}),
+        ([], {"sentiment_report": "Bullish."}),
+        ([], {"final_trade_decision": "Rating: Buy", "final_rating": "Buy"}),
+    ])
+    calls = {"n": 0}
+
+    def stop_after_first():
+        calls["n"] += 1
+        return calls["n"] > 1  # let the first chunk through, then stop
+
+    decision = run_decision_streaming(
+        graph, "NVDA", "2026-11-12", config=ExecutionConfig(), stop_check=stop_after_first
+    )
+
+    assert decision is None  # stopped at the second phase boundary

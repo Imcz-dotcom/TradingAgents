@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 import time
 
 # Inline-button callback data, so the orchestrator and tests share one spelling.
@@ -180,14 +181,14 @@ class TelegramNotifier:
         with contextlib.suppress(Exception):
             await self.bot.answer_callback_query(query.id)
 
-    async def watch_for_cancel(self, cancelled: asyncio.Event) -> None:
+    async def watch_for_cancel(self, cancelled: threading.Event) -> None:
         """Poll for a "stop" while research runs; set ``cancelled`` when it lands.
 
-        Research runs in a worker thread for a minute or two, and the normal
-        prompt loop (``_wait``) isn't active then. This is the loop that notices
-        a stop typed during that window, so the bot can ack it immediately and
-        skip the order — instead of leaving the cancel unread until the research
-        finishes and then dropping it.
+        ``cancelled`` is a ``threading.Event`` so the research worker thread can
+        also read it (via ``is_set``) and abort at its next phase boundary. This
+        is the loop that notices a stop typed while research runs, so the bot can
+        ack it immediately and abandon the run — instead of leaving the cancel
+        unread until the research finishes and then dropping it.
         """
         from telegram.error import NetworkError
 

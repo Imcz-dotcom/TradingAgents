@@ -89,14 +89,24 @@ def research_transcript(final_state: dict) -> str:
     return "\n\n".join(parts)
 
 
-def build_prompt(final_state: dict, ticker: str, history: list[tuple[str, str]], question: str) -> str:
-    """One chat turn's prompt: the research, the Q&A so far, then the question."""
+def build_prompt(final_state: dict, ticker: str, history: list[dict], question: str) -> str:
+    """One chat turn's prompt: the research, the Q&A so far, then the question.
+
+    ``history`` is the day's whole conversation (not just this ticker's), as
+    ``{"ticker", "q", "a"}`` entries. A turn about a different ticker is labelled
+    so the assistant can tell which research a past answer drew on.
+    """
     transcript = research_transcript(final_state)
     history_block = ""
     if history:
-        history_block = "## Conversation so far\n" + "\n\n".join(
-            f"Q: {q}\nA: {a}" for q, a in history
-        )
+        lines = []
+        for entry in history:
+            q, a = entry.get("q"), entry.get("a")
+            if entry.get("ticker") and entry.get("ticker") != ticker:
+                lines.append(f"Q (about {entry['ticker']}): {q}\nA: {a}")
+            else:
+                lines.append(f"Q: {q}\nA: {a}")
+        history_block = "## Conversation so far\n" + "\n\n".join(lines)
 
     return (
         "You are a research assistant answering questions about a completed "
@@ -110,7 +120,7 @@ def build_prompt(final_state: dict, ticker: str, history: list[tuple[str, str]],
     )
 
 
-def answer(final_state: dict, ticker: str, history: list[tuple[str, str]], question: str) -> str:
+def answer(final_state: dict, ticker: str, history: list[dict], question: str) -> str:
     """Answer one question about the research, returning the model's reply."""
     result = _deep_llm().invoke(build_prompt(final_state, ticker, history, question)).content
     return result if isinstance(result, str) else str(result)

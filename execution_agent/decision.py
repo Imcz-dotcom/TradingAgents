@@ -285,10 +285,16 @@ def run_decision_streaming(
     config,
     portfolio=None,
     on_step=None,
-) -> DecisionResult:
+    stop_check=None,
+) -> DecisionResult | None:
     """Like :func:`run_decision`, but stream the graph and call ``on_step(label)``
     as each phase finishes. ``on_step`` is synchronous and called from the same
     thread that runs the graph — the caller bridges it to Telegram if needed.
+
+    ``stop_check`` is an optional zero-arg callable polled between phases; when it
+    returns True the run returns ``None`` immediately (the partial state is
+    discarded), so a cancel aborts at the next phase boundary rather than waiting
+    out the whole pipeline.
     """
     yahoo = normalize_symbol(ticker)
     moomoo = to_moomoo(ticker)  # rejects crypto/forex/futures/indices before any LLM call
@@ -305,6 +311,8 @@ def run_decision_streaming(
     last_debate_round = 0
     last_risk_round = 0
     for _, chunk in graph.stream_run(graph_input, **args):
+        if stop_check is not None and stop_check():
+            return None  # cancelled mid-run: the partial state is discarded
         if chunk is None:
             continue
         final_state.update(chunk)
