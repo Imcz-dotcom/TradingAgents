@@ -5,7 +5,7 @@ import os
 import pytest
 
 import execution_agent.config as config_mod
-from execution_agent.config import ExecutionConfig
+from execution_agent.config import ExecutionConfig, mode_label
 
 
 def _clear_exec_env(monkeypatch):
@@ -90,3 +90,8 @@ def test_side_mapping_rejects_invalid_json():
 def test_side_mapping_rejects_non_string_values():
     with pytest.raises(ValueError):
         ExecutionConfig(side_mapping='{"Buy": 1}')
+
+
+def test_mode_label_paper_and_real():
+    assert "PAPER" in mode_label("SIMULATE")
+    assert "REAL" in mode_label("REAL")

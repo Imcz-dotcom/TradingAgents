@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import math
 
+from execution_agent.symbols import trd_market
+
 
 def _moomoo():
     """Import the SDK lazily (an optional extra) so the module is import-light."""
@@ -66,7 +68,7 @@ class MoomooBroker:
         )
         try:
             trd_env = self._trd_env(moomoo)
-            acc_id = self._resolve_acc_id(trd_ctx, trd_env, moomoo)
+            acc_id = self._resolve_acc_id(trd_ctx, trd_env, moomoo, symbol)
             trd_side = moomoo.TrdSide.BUY if side == "BUY" else moomoo.TrdSide.SELL
 
             # MARKET order: price is ignored by the broker, so send 0.0.
@@ -88,8 +90,16 @@ class MoomooBroker:
         finally:
             trd_ctx.close()
 
-    def _resolve_acc_id(self, trd_ctx, trd_env, moomoo) -> int:
-        """The account id for ``trd_env`` (SIMULATE/REAL), or a clear error."""
+    def _resolve_acc_id(self, trd_ctx, trd_env, moomoo, symbol) -> int:
+        """The account id for ``trd_env`` (SIMULATE/REAL), or a clear error.
+
+        Prefers an account whose ``trdmarket_auth`` covers ``symbol``'s market.
+        A multi-account login often lists a HK/CN paper account first, which
+        would otherwise be chosen for a US order and rejected by the broker with
+        "does not support trading US.NVDA". If no account lists the market, the
+        error names every account and its markets instead of leaving the user to
+        guess.
+        """
         ret, data = trd_ctx.get_acc_list()
         if ret != moomoo.RET_OK:
             raise RuntimeError(f"could not list accounts: {data}")
@@ -98,4 +108,15 @@ class MoomooBroker:
             raise RuntimeError(
                 f"no {self.trading_env} account found — is OpenD logged in with one?"
             )
-        return int(matching["acc_id"].iloc[0])
+        market = trd_market(symbol)
+        for _, row in matching.iterrows():
+            if market in (row.get("trdmarket_auth") or []):
+                return int(row["acc_id"])
+        accounts = ", ".join(
+            f"{int(r['acc_id'])} ({', '.join(map(str, r.get('trdmarket_auth') or ['none']))})"
+            for _, r in matching.iterrows()
+        )
+        raise RuntimeError(
+            f"no {self.trading_env} account supports {symbol} (market {market}); "
+            f"available accounts: {accounts}"
+        )

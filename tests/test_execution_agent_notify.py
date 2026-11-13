@@ -7,7 +7,17 @@ an extra, so button markup is built and asserted for real.
 
 import asyncio
 
-from execution_agent.notify import APPROVE, REJECT, SHARES, USD, TelegramNotifier
+import pytest
+
+from execution_agent.notify import (
+    APPROVE,
+    REJECT,
+    SHARES,
+    STOP,
+    USD,
+    TelegramNotifier,
+    is_stop,
+)
 
 
 class FakeMessage:
@@ -38,7 +48,7 @@ class FakeBot:
         self.sent = []
         self.answered = []
 
-    async def send_message(self, chat_id, text, reply_markup=None):
+    async def send_message(self, chat_id, text, reply_markup=None, read_timeout=None):
         self.sent.append((chat_id, text, reply_markup))
 
     async def get_updates(self, offset=None, timeout=0, allowed_updates=None):
@@ -50,6 +60,55 @@ class FakeBot:
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+# ---- send (retry policy) ----------------------------------------------------
+
+
+def test_send_does_not_duplicate_on_timeout():
+    """A read timeout means the message may already be delivered — never retry."""
+    from telegram.error import TimedOut
+
+    class TimeoutBot:
+        def __init__(self):
+            self.calls = 0
+
+        async def send_message(self, chat_id, text, reply_markup=None, read_timeout=None):
+            self.calls += 1
+            raise TimedOut("Timed out")
+
+    bot = TimeoutBot()
+    _run(TelegramNotifier("tok", 111, bot=bot).send("hi"))
+    assert bot.calls == 1  # one attempt, no duplicate
+
+
+def test_drain_confirms_pending_updates():
+    """Startup drain advances past a stale message so it isn't replayed."""
+    bot = FakeBot(polls=[[FakeUpdate(5, message=FakeMessage(111, "NVDA"))]])
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+
+    _run(notifier.drain())
+
+    assert notifier._offset == 6  # stale update confirmed; a fresh poll skips it
+
+
+def test_send_retries_on_connection_failure():
+    """A connection failure means nothing was sent — safe to retry a few times."""
+    from telegram.error import NetworkError
+
+    class FlakyBot:
+        def __init__(self):
+            self.calls = 0
+
+        async def send_message(self, chat_id, text, reply_markup=None, read_timeout=None):
+            self.calls += 1
+            if self.calls < 3:
+                raise NetworkError("boom")
+            return None
+
+    bot = FlakyBot()
+    _run(TelegramNotifier("tok", 111, bot=bot).send("hi"))
+    assert bot.calls == 3  # retried the connection failure
 
 
 # ---- ask_text --------------------------------------------------------------
@@ -136,3 +195,51 @@ def test_ask_button_timeout_returns_none():
 
     assert _run(notifier.ask_button("Approve?", [("Approve", APPROVE)], 0)) is None
     assert bot.answered == []
+
+
+# ---- stop words -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["stop", "STOP", " Stop ", "/stop", "/cancel", "cancel", "abort", "quit"],
+)
+def test_is_stop_true(text):
+    assert is_stop(text) is True
+
+
+@pytest.mark.parametrize("text", ["", "  ", "stocks", "NVDA", "500", "/run NVDA", None])
+def test_is_stop_false(text):
+    assert is_stop(text) is False
+
+
+def test_ask_text_returns_stop_on_stop_word():
+    bot = FakeBot(polls=[[], [FakeUpdate(1, message=FakeMessage(111, "stop"))]])
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+
+    assert _run(notifier.ask_text("How much?", 300)) == STOP
+
+
+def test_ask_button_returns_stop_on_stop_word():
+    bot = FakeBot(polls=[[], [FakeUpdate(1, message=FakeMessage(111, "/cancel"))]])
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+
+    assert _run(notifier.ask_button("Approve?", [("Approve", APPROVE)], 300)) == STOP
+
+
+def test_drain_pending_surfaces_a_pending_stop():
+    """A stop already in the queue (typed during research) aborts the next prompt."""
+    bot = FakeBot(polls=[[FakeUpdate(1, message=FakeMessage(111, "stop"))]])
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+
+    assert _run(notifier._drain_pending()) == STOP
+    assert notifier._offset == 2  # consumed, so a later poll won't re-see it
+
+
+def test_drain_pending_drops_non_stop_messages():
+    """A stale ticker in the queue is still dropped, not surfaced as an answer."""
+    bot = FakeBot(polls=[[FakeUpdate(1, message=FakeMessage(111, "NVDA"))]])
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+
+    assert _run(notifier._drain_pending()) is None
+    assert notifier._offset == 2

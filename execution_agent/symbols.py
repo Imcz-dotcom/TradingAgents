@@ -98,3 +98,24 @@ def to_moomoo(symbol: str) -> str:
     if result != canonical:
         logger.info("Mapped Yahoo symbol %r to Moomoo symbol %r", canonical, result)
     return result
+
+
+# Moomoo reports each account's tradable markets via ``trdmarket_auth`` using
+# TrdMarket strings ("US", "HK", "CN", "JP", ...). China A-shares are one market
+# there ("CN") even though the broker symbol spells Shanghai/Shenzhen separately.
+_TRD_MARKET_BY_PREFIX = {
+    "SH": "CN",
+    "SZ": "CN",
+}
+
+
+def trd_market(moomoo_symbol: str) -> str:
+    """The Moomoo market code (a TrdMarket string) for a ``MARKET.CODE`` symbol.
+
+    ``US.NVDA`` -> ``"US"``, ``HK.00700`` -> ``"HK"``, ``SH.600519`` -> ``"CN"``.
+    Used to pick the account that can actually trade a symbol: a multi-account
+    login often lists a HK/CN paper account first, which would otherwise be
+    selected for a US order and rejected with "does not support trading".
+    """
+    prefix = str(moomoo_symbol).split(".", 1)[0].upper()
+    return _TRD_MARKET_BY_PREFIX.get(prefix, prefix)

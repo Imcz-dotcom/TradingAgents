@@ -2,7 +2,7 @@
 
 import pytest
 
-from execution_agent.symbols import to_moomoo
+from execution_agent.symbols import to_moomoo, trd_market
 
 
 @pytest.mark.parametrize(
@@ -66,3 +66,19 @@ def test_to_moomoo_rejects_unsupported(symbol):
 def test_to_moomoo_rejects_non_string():
     with pytest.raises(ValueError):
         to_moomoo(None)
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        ("US.NVDA", "US"),
+        ("HK.00700", "HK"),
+        ("SH.600519", "CN"),  # China A-shares collapse to one Moomoo market
+        ("SZ.000001", "CN"),
+        ("JP.7203", "JP"),
+        ("SG.D05", "SG"),
+        ("UK.VOD", "UK"),
+    ],
+)
+def test_trd_market(symbol, expected):
+    assert trd_market(symbol) == expected

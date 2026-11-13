@@ -20,7 +20,9 @@ def fake_moomoo(monkeypatch):
         "quote_ret": 0,
         "quote_data": pd.DataFrame({"last_price": [45.0]}),
         "acc_ret": 0,
-        "acc_data": pd.DataFrame({"acc_id": [123], "trd_env": ["SIMULATE"]}),
+        "acc_data": pd.DataFrame(
+            {"acc_id": [123], "trd_env": ["SIMULATE"], "trdmarket_auth": [["US"]]}
+        ),
         "order_ret": 0,
         "order_data": pd.DataFrame({"order_id": [999], "order_status": ["SUBMITTED"]}),
         "created": [],
@@ -113,7 +115,9 @@ def test_place_order_buy(fake_moomoo):
 
 
 def test_place_order_sell_real_env(fake_moomoo):
-    fake_moomoo["acc_data"] = pd.DataFrame({"acc_id": [7], "trd_env": ["REAL"]})
+    fake_moomoo["acc_data"] = pd.DataFrame(
+        {"acc_id": [7], "trd_env": ["REAL"], "trdmarket_auth": [["US"]]}
+    )
     broker = MoomooBroker(trading_env="REAL")
 
     broker.place_order("US.NVDA", "SELL", 3.0)
@@ -130,6 +134,32 @@ def test_place_order_raises_when_no_account_for_env(fake_moomoo):
     broker = MoomooBroker(trading_env="SIMULATE")  # only REAL account exists
 
     with pytest.raises(RuntimeError, match="no SIMULATE account"):
+        broker.place_order("US.NVDA", "BUY", 1.0)
+
+
+def test_place_order_prefers_account_matching_market(fake_moomoo):
+    # A HK paper account is listed first; the US order must pick the US account.
+    fake_moomoo["acc_data"] = pd.DataFrame(
+        {
+            "acc_id": [100, 200],
+            "trd_env": ["SIMULATE", "SIMULATE"],
+            "trdmarket_auth": [["HK"], ["US"]],
+        }
+    )
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.place_order("US.NVDA", "BUY", 1.0)
+
+    assert fake_moomoo["created"][0].place_args["acc_id"] == 200
+
+
+def test_place_order_raises_when_no_account_matches_market(fake_moomoo):
+    fake_moomoo["acc_data"] = pd.DataFrame(
+        {"acc_id": [100], "trd_env": ["SIMULATE"], "trdmarket_auth": [["HK"]]}
+    )
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    with pytest.raises(RuntimeError, match="no SIMULATE account supports US.NVDA"):
         broker.place_order("US.NVDA", "BUY", 1.0)
 
 

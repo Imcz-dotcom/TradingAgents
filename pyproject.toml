@@ -50,7 +50,7 @@ execution = [
 
 [project.scripts]
 tradingagents = "cli.main:app"
-tradingagents-execution = "execution_agent.main:app"
+czagent = "execution_agent.main:app"
 
 [tool.setuptools.dynamic]
 version = {attr = "tradingagents.__version__"}

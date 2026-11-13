@@ -107,3 +107,8 @@ class ExecutionConfig:
 
 
 DEFAULT_CONFIG = ExecutionConfig()
+
+
+def mode_label(trading_env: str) -> str:
+    """A short human label for a trading_env value, for Telegram messages."""
+    return "🔴 REAL (live)" if trading_env == "REAL" else "📄 PAPER (simulate)"

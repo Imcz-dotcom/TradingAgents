@@ -15,11 +15,10 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from execution_agent.symbols import to_moomoo
-from tradingagents.agents.rating import is_review
+from tradingagents.agents.rating import is_review, run_rating
 from tradingagents.dataflows.symbols import normalize_symbol
 
 # Default rating -> side. Hold and REVIEW are intentionally absent: a Hold is a
@@ -144,46 +143,43 @@ def summary_from(final_state: dict) -> str:
     return ""
 
 
-def build_order(
-    *,
-    signal: str,
-    summary: str,
-    yahoo: str,
-    moomoo: str,
-    config,
-    cash: float | None = None,
-    position_quantity: float | None = None,
-    last_price: float | None = None,
-) -> ProposedOrder | None:
-    """Map a decision's signal to a ProposedOrder, or None when not actionable.
+@dataclass(frozen=True)
+class DecisionResult:
+    """A run's outcome: direction and symbols, before any quantity is set.
 
-    None for Hold / REVIEW (no side) and for a degenerate quantity (nothing to
-    order — e.g. amount too small for one unit, or nothing held to sell). Raises
-    ``ValueError`` when a required input (price / cash) is missing.
+    ``side`` is "BUY"/"SELL" or None (Hold / REVIEW). Quantity is chosen later,
+    in the Telegram chat, so it is deliberately not part of this result.
     """
-    side = side_for(signal, config.parsed_side_mapping())
-    if side is None:
-        return None
 
-    quantity = quantity_for(
-        side,
-        sizing_mode=config.sizing_mode,
-        sizing_amount=config.sizing_amount,
-        cash=cash,
-        position_quantity=position_quantity,
-        last_price=last_price,
-    )
-    if quantity <= 0:
-        return None
+    yahoo: str
+    moomoo: str
+    signal: str
+    side: str | None
+    summary: str
+    cash: float | None
+    position_quantity: float | None
 
+
+def to_order(
+    decision: DecisionResult, quantity: float, side: str | None = None
+) -> ProposedOrder | None:
+    """Assemble a ProposedOrder for a decision and a whole-unit quantity.
+
+    ``side`` overrides ``decision.side`` (the human may flip the AI's call in
+    chat); it defaults to the decision's own side when not given. None when the
+    quantity is not actionable (zero/negative) or there is no side.
+    """
+    side = side or decision.side
+    if side is None or quantity <= 0:
+        return None
     return ProposedOrder(
-        symbol_yahoo=yahoo,
-        symbol_moomoo=moomoo,
+        symbol_yahoo=decision.yahoo,
+        symbol_moomoo=decision.moomoo,
         side=side,
         quantity=quantity,
         order_type="MARKET",
-        rating=signal,
-        summary=summary,
+        rating=decision.signal,
+        summary=decision.summary,
     )
 
 
@@ -194,20 +190,69 @@ def run_decision(
     *,
     config,
     portfolio=None,
-    price_provider: Callable[[str], float] | None = None,
-) -> tuple[dict, ProposedOrder | None]:
-    """Run the graph for ``ticker`` on ``date`` and translate to a ProposedOrder.
+) -> DecisionResult:
+    """Run the graph for ``ticker`` on ``date`` and return its decision context.
 
     ``graph`` is a ``TradingAgentsGraph`` instance (injected so unit tests can
-    substitute a fake). ``price_provider`` is ``callable(symbol_moomoo) -> float``,
-    used only by notional / percent_of_cash sizing. Returns ``(final_state,
-    order)``; ``order`` is None for Hold / REVIEW or a non-actionable quantity.
+    substitute a fake). Quantity is not computed here — it is chosen by the user
+    in Telegram — so this stays free of any broker/price dependency.
     """
     yahoo = normalize_symbol(ticker)
     moomoo = to_moomoo(ticker)  # rejects crypto/forex/futures/indices before any LLM call
 
     final_state, signal = graph.propagate(yahoo, date, portfolio=portfolio)
 
+    return _decision_from(yahoo, moomoo, signal, final_state, config, portfolio)
+
+
+# State keys that signal a research phase finished, in the order they complete.
+# The serve bot turns each into a one-line Telegram update so a run that takes
+# minutes doesn't look frozen. The debate/risk states are handled separately
+# below: they run several rounds, so they report each round rather than one
+# premature "done" after the first argument.
+MILESTONES: tuple[tuple[str, str], ...] = (
+    ("market_report", "📊 Market analysis done"),
+    ("sentiment_report", "💬 Sentiment analysis done"),
+    ("news_report", "📰 News analysis done"),
+    ("fundamentals_report", "🏦 Fundamentals analysis done"),
+    ("trader_investment_plan", "🎯 Trader's plan done"),
+    ("final_trade_decision", "✅ Final decision reached"),
+)
+
+# Speakers per round in each debate: the investment debate alternates bull and
+# bear (2), the risk review cycles aggressive / conservative / neutral (3).
+_DEBATE_SPEAKERS = 2
+_RISK_SPEAKERS = 3
+
+
+def _phase_complete(key: str, state: dict) -> bool:
+    """Whether ``state`` marks phase ``key`` as finished (non-empty)."""
+    value = state.get(key)
+    if not value:
+        return False
+    if isinstance(value, dict):
+        # Debate/risk states are dicts; done once any field has real content.
+        return any(isinstance(v, str) and v.strip() for v in value.values())
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _debate_round(state: dict, key: str, speakers_per_round: int) -> int | None:
+    """The 1-based round a debate state is on, or None before it starts.
+
+    ``count`` is the number of speaker turns finished so far; one round spans
+    ``speakers_per_round`` turns. Returns None when the debate hasn't begun, so
+    callers stay silent (and never emit a "round 0").
+    """
+    value = state.get(key)
+    if not isinstance(value, dict):
+        return None
+    count = value.get("count")
+    if not isinstance(count, int) or count <= 0:
+        return None
+    return (count + speakers_per_round - 1) // speakers_per_round
+
+
+def _decision_from(yahoo, moomoo, signal, final_state, config, portfolio) -> DecisionResult:
     cash = portfolio.cash if portfolio is not None else None
     position_quantity = None
     if portfolio is not None:
@@ -215,20 +260,68 @@ def run_decision(
         if position is not None:
             position_quantity = position.quantity
 
-    last_price = None
-    if config.sizing_mode != "shares":
-        if price_provider is None:
-            raise ValueError("sizing needs a price_provider, but none was provided")
-        last_price = price_provider(moomoo)
-
-    order = build_order(
-        signal=signal,
-        summary=summary_from(final_state),
+    return DecisionResult(
         yahoo=yahoo,
         moomoo=moomoo,
-        config=config,
+        signal=signal,
+        side=side_for(signal, config.parsed_side_mapping()),
+        summary=summary_from(final_state),
         cash=cash,
         position_quantity=position_quantity,
-        last_price=last_price,
     )
-    return final_state, order
+
+
+def run_decision_streaming(
+    graph,
+    ticker: str,
+    date: str,
+    *,
+    config,
+    portfolio=None,
+    on_step=None,
+) -> DecisionResult:
+    """Like :func:`run_decision`, but stream the graph and call ``on_step(label)``
+    as each phase finishes. ``on_step`` is synchronous and called from the same
+    thread that runs the graph — the caller bridges it to Telegram if needed.
+    """
+    yahoo = normalize_symbol(ticker)
+    moomoo = to_moomoo(ticker)  # rejects crypto/forex/futures/indices before any LLM call
+
+    init_state = graph.create_run_state(yahoo, date, "stock", portfolio)
+    graph_input = graph.checkpoint_input(init_state)
+    args = graph.propagator.get_graph_args()
+
+    final_state: dict = {}
+    seen: set[str] = set()
+    cfg = getattr(graph, "config", {}) or {}
+    max_debate = int(cfg.get("max_debate_rounds") or 1)
+    max_risk = int(cfg.get("max_risk_discuss_rounds") or 1)
+    last_debate_round = 0
+    last_risk_round = 0
+    for _, chunk in graph.stream_run(graph_input, **args):
+        if chunk is None:
+            continue
+        final_state.update(chunk)
+        for key, label in MILESTONES:
+            if key not in seen and _phase_complete(key, chunk):
+                seen.add(key)
+                if on_step is not None:
+                    on_step(label)
+        # The debates run several rounds; report each one so the minutes between
+        # "market" and "trader" don't look frozen.
+        round_ = _debate_round(chunk, "investment_debate_state", _DEBATE_SPEAKERS)
+        if round_ is not None and round_ > last_debate_round:
+            last_debate_round = round_
+            if on_step is not None:
+                on_step(f"⚖️ Bull/bear debate — round {round_}/{max_debate}")
+        round_ = _debate_round(chunk, "risk_debate_state", _RISK_SPEAKERS)
+        if round_ is not None and round_ > last_risk_round:
+            last_risk_round = round_
+            if on_step is not None:
+                on_step(f"🛡️ Risk review — round {round_}/{max_risk}")
+
+    graph.record_decision(yahoo, date, final_state)
+    graph.clear_checkpoint_on_success(yahoo, date, "stock", portfolio)
+
+    signal = run_rating(final_state)
+    return _decision_from(yahoo, moomoo, signal, final_state, config, portfolio)
