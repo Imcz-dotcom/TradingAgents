@@ -5,6 +5,7 @@ import pytest
 from execution_agent.config import ExecutionConfig
 from execution_agent.decision import (
     build_order,
+    parse_amount,
     quantity_for,
     run_decision,
     side_for,
@@ -191,3 +192,32 @@ def test_run_decision_rejects_crypto_before_running():
     with pytest.raises(ValueError):
         run_decision(graph, "BTC-USD", "2026-11-12", config=cfg)
     assert graph.calls == []  # never reached the LLM
+
+
+# ---- parse_amount (chat "how much?" replies) --------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "number", "unit"),
+    [
+        ("500", 500.0, None),            # bare number -> ambiguous, caller asks
+        ("$500", 500.0, "usd"),
+        ("500 usd", 500.0, "usd"),
+        ("500 USD", 500.0, "usd"),
+        ("500.50 usd", 500.5, "usd"),
+        ("500 dollars", 500.0, "usd"),
+        ("10 shares", 10.0, "shares"),
+        ("10 share", 10.0, "shares"),
+        ("10 sh", 10.0, "shares"),
+        ("10 shs", 10.0, "shares"),
+        ("buy 20 shares please", 20.0, "shares"),
+    ],
+)
+def test_parse_amount(text, number, unit):
+    assert parse_amount(text) == (number, unit)
+
+
+@pytest.mark.parametrize("text", ["", "   ", "no number", "zero", "0", "-5"])
+def test_parse_amount_rejects(text):
+    with pytest.raises(ValueError):
+        parse_amount(text)

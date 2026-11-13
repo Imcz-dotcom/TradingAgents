@@ -14,6 +14,7 @@ readable summary for the approval message, never parsed for numbers.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -95,6 +96,43 @@ def quantity_for(
     if side == _SELL and position_quantity is not None:
         qty = min(qty, position_quantity)
     return float(math.floor(qty))
+
+
+# A number anywhere in the reply, e.g. "500", "$500", "10 shares". The optional
+# sign is captured so a negative amount is parsed and then rejected below.
+_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+# Unit markers in the reply. "shares" wins over "dollars" so "500 shares usd"
+# never misreads; a bare number carries no unit and the caller asks for it.
+_SHARE_RE = re.compile(r"\bshares?\b|\bshs\b|\bsh\b")
+_DOLLAR_RE = re.compile(r"\$|\busd\b|\bdollars?\b|\bbucks?\b")
+
+
+def parse_amount(text: str) -> tuple[float, str | None]:
+    """Parse a user's "how much?" reply into ``(number, unit)``.
+
+    ``unit`` is ``"shares"`` or ``"usd"`` when the reply says which, else
+    ``None`` (a bare number — the caller then asks "dollars or shares?").
+    Accepts "500", "$500", "500 usd", "10 shares", "10 sh". Raises
+    ``ValueError`` when there is no positive number to read.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("amount must be a non-empty string")
+    s = text.strip().lower()
+
+    match = _NUMBER_RE.search(s)
+    if match is None:
+        raise ValueError(f"no number found in {text!r}")
+    number = float(match.group())
+    if number <= 0:
+        raise ValueError(f"amount must be positive, got {text!r}")
+
+    if _SHARE_RE.search(s):
+        unit = "shares"
+    elif _DOLLAR_RE.search(s):
+        unit = "usd"
+    else:
+        unit = None
+    return number, unit
 
 
 def summary_from(final_state: dict) -> str:
