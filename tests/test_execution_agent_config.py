@@ -28,6 +28,7 @@ def test_defaults_are_safe():
     assert cfg.moomoo_host == "127.0.0.1"
     assert cfg.moomoo_port == 11111
     assert cfg.approval_timeout_seconds == 300
+    assert cfg.log_retention_days == 7
     assert cfg.telegram_bot_token is None
     assert cfg.telegram_chat_id is None
 
@@ -71,6 +72,16 @@ def test_validate_rejects_bad_sizing_mode():
 def test_validate_rejects_non_positive_sizing_amount():
     with pytest.raises(ValueError):
         ExecutionConfig(sizing_amount=0)
+
+
+def test_validate_rejects_non_positive_log_retention():
+    with pytest.raises(ValueError):
+        ExecutionConfig(log_retention_days=0)
+
+
+def test_env_override_log_retention(isolated_env):
+    isolated_env.setenv("EXECUTION_AGENT_LOG_RETENTION_DAYS", "14")
+    assert ExecutionConfig.from_env().log_retention_days == 14
 
 
 def test_side_mapping_parses_json():

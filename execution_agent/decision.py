@@ -149,6 +149,10 @@ class DecisionResult:
 
     ``side`` is "BUY"/"SELL" or None (Hold / REVIEW). Quantity is chosen later,
     in the Telegram chat, so it is deliberately not part of this result.
+    ``research`` carries the full final state of the run (all analyst reports,
+    the bull/bear debate, the trader and risk debates, the plans and the final
+    decision) so the serve bot can answer follow-up questions about it — the
+    one-line ``summary`` alone would throw most of that away.
     """
 
     yahoo: str
@@ -158,6 +162,7 @@ class DecisionResult:
     summary: str
     cash: float | None
     position_quantity: float | None
+    research: dict | None = None
 
 
 def to_order(
@@ -268,6 +273,7 @@ def _decision_from(yahoo, moomoo, signal, final_state, config, portfolio) -> Dec
         summary=summary_from(final_state),
         cash=cash,
         position_quantity=position_quantity,
+        research=final_state,
     )
 
 

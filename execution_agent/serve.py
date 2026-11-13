@@ -1,17 +1,21 @@
-"""Persistent Telegram bot: drive the whole execution flow from chat.
+"""Persistent Telegram bot: research, then execute on your own schedule.
 
-Run ``czagent serve`` and leave the laptop running. From your
-phone, send a ticker (``NVDA``, ``0700.HK``) or ``/run NVDA``; the bot runs the
-research and then walks you through direction -> amount -> dollars/shares ->
-Approve/Reject, exactly like the one-shot ``run`` command, but the ticker and
-date come from the chat (the date defaults to today). One trade runs at a time;
-after it finishes the bot returns to listening.
+Run ``czagent serve`` and leave the laptop running. From your phone you can:
 
-Chat controls:
-  ``/mode``          — show the current mode (paper or real).
-  ``/mode paper``    — switch to paper (simulate).
-  ``/mode real``     — switch to real (confirmed first).
-  ``stop``           — abort whatever the bot is waiting on.
+  ``NVDA`` / ``/research NVDA`` — run the research, store the full result, and
+                                  send the summary + AI's Buy/Sell. No order.
+  ``/execute``               — run the approval flow on the last research
+                                  (direction -> amount -> dollars/shares ->
+                                  Approve/Reject), exactly like ``run``.
+  ``/chat <question>``       — ask a question about the last research (the bot
+                                  answers from the full reports/debates, not the
+                                  one-line summary). Multi-turn.
+  ``/mode`` / ``/mode paper`` / ``/mode real`` — show or switch paper/live.
+  ``stop``                   — abort whatever the bot is waiting on.
+
+Research and execution are deliberately separate: research takes minutes, and
+you may not want to answer "how much?" the instant it finishes. Research is
+fire-and-forget; you execute (or ask about it) whenever you're ready.
 """
 
 from __future__ import annotations
@@ -19,31 +23,58 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from dataclasses import dataclass, field
 from datetime import date
 
 import typer
 
-from execution_agent import state
+from execution_agent import chat, cleanup, state
 from execution_agent.config import ExecutionConfig, mode_label
-from execution_agent.decision import run_decision_streaming
-from execution_agent.main import approve_and_place
+from execution_agent.decision import DecisionResult, run_decision_streaming
+from execution_agent.main import TELEGRAM_MAX_CHARS, _fit_telegram, approve_and_place
 from execution_agent.notify import APPROVE, REJECT, TelegramNotifier, is_stop
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-# A leading slash command; the ticker follows, e.g. "/run NVDA" -> "NVDA".
-_COMMAND_RE = re.compile(r"^\s*/(?:run|analyze|start|trade|order)\b\s*", re.IGNORECASE)
+# A leading slash command naming a ticker to research; the ticker follows, e.g.
+# "/research NVDA" -> "NVDA". "/run" and friends are kept as aliases.
+_COMMAND_RE = re.compile(
+    r"^\s*/(?:research|run|analyze|start|trade|order)\b\s*", re.IGNORECASE
+)
 
 # "/mode", "/mode paper", "/mode real" — query or switch the trading environment.
 _MODE_RE = re.compile(r"^\s*/mode\b\s*(?P<arg>paper|real)?\s*$", re.IGNORECASE)
 
+# "/execute" — run the approval flow on the last stored research.
+_EXECUTE_RE = re.compile(r"^\s*/execute\b", re.IGNORECASE)
+
+# "/chat <question>" — ask about the last stored research.
+_CHAT_RE = re.compile(r"^\s*/chat\b\s*(?P<question>.*)$", re.IGNORECASE)
+
+# A "fresh"/"force" hint after a ticker forces a re-run even though the same
+# ticker was already researched today (the default is to reuse the stored run).
+_FRESH_RE = re.compile(r"\b(?:fresh|force|refresh|re-?run)\b", re.IGNORECASE)
+
+
+@dataclass
+class _Research:
+    """The last completed research run, held in memory for /execute and /chat."""
+
+    ticker: str
+    date: str
+    decision: DecisionResult  # carries .research = the full final state
+    chat_history: list[tuple[str, str]] = field(default_factory=list)
+    executed: bool = False
+
 
 def parse_ticker_command(text: str) -> str:
-    """Extract a bare ticker from a chat message, e.g. ``/run NVDA`` -> ``NVDA``.
+    """Extract a bare ticker to research, e.g. ``/research NVDA`` -> ``NVDA``.
 
     Returns "" when the message has no ticker to read (an empty message or a
     bare command with nothing after it).
     """
+    if not isinstance(text, str):
+        return ""
     cleaned = _COMMAND_RE.sub("", text.strip())
     return cleaned.split()[0] if cleaned else ""
 
@@ -61,8 +92,38 @@ def parse_mode_command(text: str) -> tuple[bool, str | None]:
     return True, (arg.lower() if arg else None)
 
 
+def is_execute_command(text: str) -> bool:
+    """Whether ``text`` is an "/execute" request (run the approval flow)."""
+    return isinstance(text, str) and bool(_EXECUTE_RE.match(text.strip()))
+
+
+def parse_chat_command(text: str) -> tuple[bool, str]:
+    """Parse a "/chat <question>" message -> ``(is_chat, question)``.
+
+    ``question`` is the text after "/chat" ("" when there is none), so a bare
+    "/chat" is a request for the current research with nothing to answer yet.
+    """
+    if not isinstance(text, str):
+        return False, ""
+    m = _CHAT_RE.match(text.strip())
+    if m is None:
+        return False, ""
+    return True, m.group("question").strip()
+
+
+def _research_summary(decision: DecisionResult, trading_env: str) -> str:
+    """The message sent when research finishes: mode, call, and the full summary."""
+    header = (
+        f"{mode_label(trading_env)}\n"
+        f"TradingAgents says {decision.side} {decision.yahoo} (rating: {decision.signal}).\n\n"
+    )
+    footer = "\n\n/execute to trade · /chat to ask a question."
+    summary = _fit_telegram(decision.summary, TELEGRAM_MAX_CHARS - len(header) - len(footer))
+    return header + summary + footer
+
+
 async def serve_loop(config: ExecutionConfig) -> None:
-    """Listen for tickers and run the flow for each, forever."""
+    """Listen for commands and drive research / execute / chat, forever."""
     audit = state.audit_path()
     notifier = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
     # Trading environment, switchable from chat with /mode paper|real. Starts
@@ -74,9 +135,9 @@ async def serve_loop(config: ExecutionConfig) -> None:
     with contextlib.suppress(Exception):
         await notifier.send(
             f"🤖 Execution agent running ({mode_label(mode)}). "
-            "Send a ticker (e.g. `NVDA` or `/run NVDA`)."
+            "Send a ticker (e.g. `NVDA`) to research, then `/execute` to trade or `/chat` to ask."
         )
-    typer.echo("✅ Bot is running — send a ticker from Telegram (e.g. `NVDA`). Ctrl-C to stop.")
+    typer.echo("✅ Bot is running — send a ticker to research, `/execute` to trade, `/chat` to ask. Ctrl-C to stop.")
 
     # Live progress: run the research in a worker thread so the event loop is
     # free to send a one-line Telegram update as each phase finishes. Without
@@ -93,10 +154,132 @@ async def serve_loop(config: ExecutionConfig) -> None:
         loop.call_soon_threadsafe(asyncio.create_task, _send_progress(label))
 
     # Drop any messages that arrived before this startup (e.g. a stale "NVDA"
-    # from a previous crash). Otherwise a restart replays it and trades on it
+    # from a previous crash). Otherwise a restart replays it and researches it
     # without the user sending anything now.
     with contextlib.suppress(Exception):
         await notifier.drain()
+
+    # Housekeeping: drop research logs older than a week so the results dir
+    # doesn't grow without bound. Best-effort — a failed cleanup must not stop
+    # the bot.
+    with contextlib.suppress(Exception):
+        removed = cleanup.purge_old_logs(
+            DEFAULT_CONFIG["results_dir"], max_age_days=config.log_retention_days
+        )
+        if removed:
+            typer.echo(f"🧹 Removed {removed} stale log file(s) older than a week.")
+
+    research: _Research | None = None
+
+    async def handle_research(ticker: str, fresh: bool = False) -> None:
+        nonlocal research
+        today = date.today().isoformat()
+        # Same ticker on the same trading day: reuse the research already held in
+        # memory instead of paying for another full pipeline run. The data is keyed
+        # by date, so a re-run later the same day would read the same inputs; the
+        # only way it changes is a fresh run (forced with "/research NVDA fresh").
+        if not fresh and research is not None and research.ticker == ticker and research.date == today:
+            d = research.decision
+            call = f"{d.side} {d.yahoo}" if d.side else f"no order on {d.yahoo}"
+            typer.echo(f"📚 {ticker}: reuse today's research — not re-running.")
+            await notifier.send(
+                f"📚 Already researched {ticker} today — {call} (rating {d.signal}). "
+                "Not re-running. `/execute` to trade or `/chat` to ask. "
+                f"Send `/research {ticker} fresh` to force a new run."
+            )
+            return
+        typer.echo(f"📥 {ticker} — running research…")
+        try:
+            await notifier.send(f"📥 Got {ticker} — running research, this takes a minute…")
+        except Exception as exc:  # noqa: BLE001 — a failed ack must not kill the bot
+            typer.echo(f"⚠️ Couldn't reply on Telegram: {exc}", err=True)
+        try:
+            graph = TradingAgentsGraph(debug=False, config=DEFAULT_CONFIG.copy())
+            # Watch for "stop" while research runs (it can take a minute or two),
+            # so a cancel is acked immediately instead of sitting unread until
+            # the run finishes and then being dropped.
+            cancelled = asyncio.Event()
+            watch = asyncio.create_task(notifier.watch_for_cancel(cancelled))
+            await asyncio.sleep(0)  # let the watcher start polling before research begins
+            try:
+                decision = await asyncio.to_thread(
+                    run_decision_streaming, graph, ticker, today, config=config, on_step=_on_step
+                )
+            finally:
+                watch.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watch
+
+            if cancelled.is_set():
+                typer.echo(f"🛑 {ticker}: stopped during research — no order.")
+                await notifier.send("🛑 Stopped — no order placed.")
+                state.append_event(audit, {"event": "skip", "reason": "stopped_during_research"})
+                return
+
+            state.append_event(
+                audit,
+                {"event": "decision", "ticker": ticker, "signal": decision.signal, "side": decision.side},
+            )
+            research = _Research(ticker=ticker, date=today, decision=decision)
+
+            if decision.side is None:
+                await notifier.send(
+                    f"No order for {decision.yahoo}: {decision.signal}. "
+                    "Still saved — `/chat` to ask about it."
+                )
+                return
+            await notifier.send(_research_summary(decision, mode))
+            typer.echo(f"📋 {ticker}: researched ({decision.signal}) — `/execute` to trade or `/chat` to ask.")
+        except ValueError as exc:  # bad ticker (crypto/forex/unknown) — don't die
+            typer.echo(f"❌ {exc}", err=True)
+            await notifier.send(f"❌ {exc}")
+            state.append_event(audit, {"event": "skip", "reason": f"bad_ticker: {exc}"})
+        except Exception as exc:  # noqa: BLE001 — log and keep the bot alive
+            typer.echo(f"❌ {exc}", err=True)
+            state.append_event(audit, {"event": "error", "message": str(exc)})
+            await notifier.send(f"❌ {exc}")
+
+    async def handle_execute() -> None:
+        res = research
+        if res is None:
+            await notifier.send("No research yet — send a ticker or `/research NVDA` first.")
+            return
+        if res.decision.side is None:
+            await notifier.send(
+                f"No trade for {res.decision.yahoo}: {res.decision.signal}. `/chat` to ask about it."
+            )
+            return
+        if res.executed:
+            await notifier.send(
+                f"{res.ticker} was already executed — send `/research {res.ticker}` for a fresh decision."
+            )
+            return
+        summary = await approve_and_place(
+            notifier, config, res.decision, audit, dry_run=False, trading_env=mode
+        )
+        if summary.startswith("✅ Order placed"):
+            res.executed = True
+        await notifier.send(summary or "Cancelled — no order placed.")
+        typer.echo(f"Done with {res.ticker}: {summary or 'no order'} — listening again.")
+
+    async def handle_chat(question: str) -> None:
+        res = research
+        if res is None:
+            await notifier.send("No research yet — send a ticker or `/research NVDA` first.")
+            return
+        if not question:
+            await notifier.send("Ask a question about the research, e.g. `/chat what's the biggest risk?`")
+            return
+        typer.echo(f"💬 {res.ticker}: answering — {question}")
+        try:
+            answer = await asyncio.to_thread(
+                chat.answer, res.decision.research, res.ticker, res.chat_history, question
+            )
+        except Exception as exc:  # noqa: BLE001 — a chat failure must not kill the bot
+            await notifier.send(f"❌ Chat failed: {exc}")
+            return
+        res.chat_history.append((question, answer))
+        await notifier.send(_fit_telegram(answer))
 
     while True:
         text = await notifier.wait_for_ticker()
@@ -124,66 +307,15 @@ async def serve_loop(config: ExecutionConfig) -> None:
                 else:
                     await notifier.send(f"Kept {mode_label(mode)}.")
             continue
+        if is_execute_command(text):
+            await handle_execute()
+            continue
+        is_chat, question = parse_chat_command(text)
+        if is_chat:
+            await handle_chat(question)
+            continue
         ticker = parse_ticker_command(text)
         if not ticker:
-            await notifier.send("Send a ticker like `NVDA` or `/run NVDA`.")
+            await notifier.send("Send a ticker like `NVDA`, or use `/execute` or `/chat <question>`.")
             continue
-
-        typer.echo(f"📥 {ticker} — running research…")
-        try:
-            await notifier.send(f"📥 Got {ticker} — running research, this takes a minute…")
-        except Exception as exc:  # noqa: BLE001 — a failed ack must not kill the bot
-            typer.echo(f"⚠️ Couldn't reply on Telegram: {exc}", err=True)
-        today = date.today().isoformat()
-        try:
-            graph = TradingAgentsGraph(debug=False, config=DEFAULT_CONFIG.copy())
-            # Watch for "stop" while research runs (it can take a minute or two),
-            # so a cancel is acked immediately instead of sitting unread until
-            # the run finishes and then being dropped.
-            cancelled = asyncio.Event()
-            watch = asyncio.create_task(notifier.watch_for_cancel(cancelled))
-            await asyncio.sleep(0)  # let the watcher start polling before research begins
-            try:
-                decision = await asyncio.to_thread(
-                    run_decision_streaming, graph, ticker, today, config=config, on_step=_on_step
-                )
-            finally:
-                watch.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await watch
-
-            if cancelled.is_set():
-                typer.echo(f"🛑 {ticker}: stopped during research — no order.")
-                await notifier.send("🛑 Stopped — no order placed.")
-                state.append_event(audit, {"event": "skip", "reason": "stopped_during_research"})
-                continue
-
-            state.append_event(
-                audit,
-                {
-                    "event": "decision",
-                    "ticker": ticker,
-                    "signal": decision.signal,
-                    "side": decision.side,
-                },
-            )
-
-            if decision.side is None:
-                typer.echo(f"↩️ {decision.yahoo}: {decision.signal} — no order.")
-                await notifier.send(f"No order for {decision.yahoo}: {decision.signal}")
-                state.append_event(audit, {"event": "skip", "reason": decision.signal})
-                continue
-
-            summary = await approve_and_place(
-                notifier, config, decision, audit, dry_run=False, trading_env=mode
-            )
-            await notifier.send(summary or "Cancelled — no order placed.")
-            typer.echo(f"Done with {ticker}: {summary or 'no order'} — listening again.")
-        except ValueError as exc:  # bad ticker (crypto/forex/unknown) — don't die
-            typer.echo(f"❌ {exc}", err=True)
-            await notifier.send(f"❌ {exc}")
-            state.append_event(audit, {"event": "skip", "reason": f"bad_ticker: {exc}"})
-        except Exception as exc:  # noqa: BLE001 — log and keep the bot alive
-            typer.echo(f"❌ {exc}", err=True)
-            state.append_event(audit, {"event": "error", "message": str(exc)})
-            await notifier.send(f"❌ {exc}")
+        await handle_research(ticker, fresh=bool(_FRESH_RE.search(text)))

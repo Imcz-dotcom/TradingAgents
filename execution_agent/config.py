@@ -58,6 +58,8 @@ class ExecutionConfig:
     sizing_mode: str = "notional"  # "notional" | "shares" | "percent_of_cash"
     sizing_amount: float = 1000.0
     approval_timeout_seconds: int = 300
+    # Delete research logs older than this many days on bot startup.
+    log_retention_days: int = 7
     # JSON-encoded rating -> side override, e.g. '{"Buy": "SELL"}' (testing only).
     side_mapping: str | None = None
 
@@ -71,6 +73,8 @@ class ExecutionConfig:
             raise ValueError(f"sizing_mode must be one of {_SIZING_MODES}, got {self.sizing_mode!r}")
         if self.sizing_amount <= 0:
             raise ValueError(f"sizing_amount must be positive, got {self.sizing_amount!r}")
+        if self.log_retention_days <= 0:
+            raise ValueError(f"log_retention_days must be positive, got {self.log_retention_days!r}")
         if self.side_mapping is not None:
             self.parsed_side_mapping()  # raises on invalid JSON / shape
 
