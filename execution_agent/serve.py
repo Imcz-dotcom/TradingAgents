@@ -13,6 +13,11 @@ Run ``czagent serve`` and leave the laptop running. From your phone you can:
                                   whole day's conversation, and can target any
                                   ticker researched today: ``/chat NVDA ...``.
   ``/mode`` / ``/mode paper`` / ``/mode real`` — show or switch paper/live.
+  ``/auto``                  — fully-automatic paper scan: read the account,
+                               research the watchlist + holdings, and manage them
+                               itself (paper only, no approval).
+  ``/auto <amount>``         — same, with a dollar budget to deploy: split across
+                               the buy ideas by the research's conviction.
   ``stop``                   — abort whatever the bot is waiting on.
 
 Research and execution are deliberately separate: research takes minutes, and
@@ -32,10 +37,11 @@ from datetime import date
 import typer
 
 from execution_agent import chat, cleanup, persist, state
+from execution_agent.auto import run_auto
 from execution_agent.config import ExecutionConfig, mode_label
-from execution_agent.decision import DecisionResult, run_decision_streaming
+from execution_agent.decision import DecisionResult, parse_amount, run_decision_streaming
 from execution_agent.main import TELEGRAM_MAX_CHARS, _fit_telegram, approve_and_place
-from execution_agent.notify import APPROVE, REJECT, TelegramNotifier, is_stop
+from execution_agent.notify import APPROVE, REJECT, SHARES, TelegramNotifier, is_stop
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -50,6 +56,9 @@ _MODE_RE = re.compile(r"^\s*/mode\b\s*(?P<arg>paper|real)?\s*$", re.IGNORECASE)
 
 # "/execute" — run the approval flow on the latest stored research.
 _EXECUTE_RE = re.compile(r"^\s*/execute\b", re.IGNORECASE)
+
+# "/auto" — run the fully-automatic paper-trading loop (no human approval).
+_AUTO_RE = re.compile(r"^\s*/auto\b", re.IGNORECASE)
 
 # "/chat <question>" — ask about today's research; an optional leading ticker
 # ("/chat NVDA ...") targets that run instead of the latest one.
@@ -100,6 +109,35 @@ def parse_mode_command(text: str) -> tuple[bool, str | None]:
 def is_execute_command(text: str) -> bool:
     """Whether ``text`` is an "/execute" request (run the approval flow)."""
     return isinstance(text, str) and bool(_EXECUTE_RE.match(text.strip()))
+
+
+def is_auto_command(text: str) -> bool:
+    """Whether ``text`` is an "/auto" request (autonomous paper scan)."""
+    return isinstance(text, str) and bool(_AUTO_RE.match(text.strip()))
+
+
+def parse_auto_command(text: str) -> tuple[bool, float | None, str | None]:
+    """Parse an "/auto" message into ``(is_auto, budget, error)``.
+
+    ``budget`` is the dollars to deploy (``None`` = manage-only), and ``error``
+    is a human message when the trailing amount is unreadable or not dollars
+    (``None`` otherwise). Not an /auto command → ``(False, None, None)``.
+    """
+    if not isinstance(text, str):
+        return False, None, None
+    m = _AUTO_RE.match(text.strip())
+    if m is None:
+        return False, None, None
+    rest = text.strip()[m.end():].strip()
+    if not rest:
+        return True, None, None  # manage-only
+    try:
+        number, unit = parse_amount(rest)
+    except ValueError:
+        return True, None, "Couldn't read that budget — use a dollar amount like `/auto 500`."
+    if unit == SHARES:
+        return True, None, "The /auto budget is in dollars, not shares — try `/auto 500`."
+    return True, number, None
 
 
 def parse_chat_command(text: str) -> tuple[bool, str]:
@@ -172,21 +210,10 @@ def _research_to_entry(res: _Research) -> dict:
 
 def _entry_to_research(ticker: str, entry: dict) -> _Research | None:
     """Rebuild a ``_Research`` from a persisted entry, or None if malformed."""
-    try:
-        d = entry["decision"]
-        decision = DecisionResult(
-            yahoo=d["yahoo"],
-            moomoo=d["moomoo"],
-            signal=d["signal"],
-            side=d["side"],
-            summary=d.get("summary", ""),
-            cash=d.get("cash"),
-            position_quantity=d.get("position_quantity"),
-            research=d.get("research") or {},
-        )
-        return _Research(ticker=ticker, decision=decision, executed=entry.get("executed", False))
-    except (KeyError, TypeError, ValueError):
+    decision = persist.decision_from_entry(entry.get("decision"))
+    if decision is None:
         return None
+    return _Research(ticker=ticker, decision=decision, executed=entry.get("executed", False))
 
 
 def _day_to_history(researches: dict, chat_history: list) -> dict:
@@ -434,6 +461,56 @@ async def serve_loop(config: ExecutionConfig) -> None:
         save_day()
         await notifier.send(_fit_telegram(answer))
 
+    async def handle_auto(budget: float | None) -> None:
+        typer.echo("🤖 /auto — running the autonomous paper scan…")
+        try:
+            if budget:
+                await notifier.send(
+                    f"🤖 /auto — deploying ${budget:g} today: I'll research the "
+                    "watchlist + holdings and split it across the buys by conviction."
+                )
+            else:
+                await notifier.send(
+                    "🤖 /auto — managing the account: I'll research the watchlist + "
+                    "holdings and sell/trim/hold per the analysis (no new buys "
+                    "without a budget)."
+                )
+        except Exception as exc:  # noqa: BLE001 — a failed ack must not kill the bot
+            typer.echo(f"⚠️ Couldn't reply on Telegram: {exc}", err=True)
+
+        # Same stop/race pattern as research: run the loop in a worker thread so
+        # the event loop stays free, and a "stop" aborts it at the next boundary.
+        stopped = threading.Event()
+        watch = asyncio.create_task(notifier.watch_for_cancel(stopped))
+        await asyncio.sleep(0)  # let the watcher start polling before /auto begins
+        runner = asyncio.create_task(
+            asyncio.to_thread(
+                run_auto,
+                config,
+                budget=budget,
+                trading_env=mode,
+                audit=audit,
+                on_step=_on_step,
+                stop_check=stopped.is_set,
+            )
+        )
+        try:
+            await asyncio.wait({runner, watch}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            watch.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watch
+
+        if runner.done():
+            summary = runner.result()  # may itself be a "stopped" summary
+        else:
+            runner.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await runner
+            summary = "🛑 Stopped — /auto aborted."
+        await notifier.send(_fit_telegram(summary))
+        typer.echo("✅ /auto complete — listening again.")
+
     while True:
         text = await notifier.wait_for_ticker()
         if text is None:
@@ -462,6 +539,13 @@ async def serve_loop(config: ExecutionConfig) -> None:
             continue
         if is_execute_command(text):
             await handle_execute()
+            continue
+        if is_auto_command(text):
+            _, budget, err = parse_auto_command(text)
+            if err:
+                await notifier.send(err)
+            else:
+                await handle_auto(budget)
             continue
         is_chat, question = parse_chat_command(text)
         if is_chat:

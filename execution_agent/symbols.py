@@ -119,3 +119,47 @@ def trd_market(moomoo_symbol: str) -> str:
     """
     prefix = str(moomoo_symbol).split(".", 1)[0].upper()
     return _TRD_MARKET_BY_PREFIX.get(prefix, prefix)
+
+
+# Moomoo market code -> Yahoo market suffix. The inverse of ``_MARKET_BY_SUFFIX``,
+# used to translate an account's positions (which OpenD reports as ``US.NVDA``)
+# back to the canonical Yahoo form the watchlist and research use.
+_YAHOO_SUFFIX_BY_MARKET = {
+    "US": "",
+    "HK": "HK",
+    "SH": "SS",  # Shanghai: Moomoo spells ".SH", Yahoo ".SS"
+    "SZ": "SZ",
+    "JP": "T",
+    "UK": "L",
+    "CA": "TO",
+    "AU": "AX",
+    "SG": "SI",
+    "KR": "KS",
+}
+
+
+def to_yahoo(moomoo_symbol: str) -> str:
+    """Translate a Moomoo ``MARKET.CODE`` back to the canonical Yahoo symbol.
+
+    The inverse of :func:`to_moomoo`: ``US.NVDA`` -> ``NVDA``, ``HK.00700`` ->
+    ``0700.HK``, ``SH.600519`` -> ``600519.SS``. Used to match the account's
+    positions (reported as Moomoo codes) against the Yahoo watchlist and to feed
+    ``PortfolioContext``. Raises ``ValueError`` for a symbol with no market
+    prefix or a prefix Moomoo would not produce.
+    """
+    if not isinstance(moomoo_symbol, str) or "." not in moomoo_symbol:
+        raise ValueError(f"not a Moomoo symbol: {moomoo_symbol!r}")
+
+    market, code = moomoo_symbol.split(".", 1)
+    market = market.upper()
+    suffix = _YAHOO_SUFFIX_BY_MARKET.get(market)
+    if suffix is None:
+        raise ValueError(f"no Yahoo mapping for Moomoo market {market!r}")
+
+    if market == "HK":
+        # Moomoo pads HK codes to 5 digits; Yahoo's canonical form is 4.
+        code = f"{int(code):04d}"
+
+    if suffix:
+        return f"{code}.{suffix}"
+    return code

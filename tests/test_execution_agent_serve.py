@@ -77,6 +77,55 @@ def test_is_execute_command_false(text):
 
 
 @pytest.mark.parametrize(
+    "text",
+    ["/auto", "/AUTO", "/auto now", "  /auto  "],
+)
+def test_is_auto_command_true(text):
+    assert serve_mod.is_auto_command(text) is True
+
+
+@pytest.mark.parametrize("text", ["auto", "NVDA", "/execute", "/autopilot", "", None])
+def test_is_auto_command_false(text):
+    assert serve_mod.is_auto_command(text) is False
+
+
+# ---- parse_auto_command ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/auto", (True, None, None)),
+        ("/AUTO", (True, None, None)),
+        ("  /auto  ", (True, None, None)),
+        ("/auto 500", (True, 500.0, None)),
+        ("/auto $500", (True, 500.0, None)),
+        ("/auto 500 usd", (True, 500.0, None)),
+        ("/auto 10.5", (True, 10.5, None)),
+    ],
+)
+def test_parse_auto_command(text, expected):
+    assert serve_mod.parse_auto_command(text) == expected
+
+
+@pytest.mark.parametrize("text", ["auto", "NVDA", "/execute", "/autopilot", "", None])
+def test_parse_auto_command_not_auto(text):
+    assert serve_mod.parse_auto_command(text) == (False, None, None)
+
+
+def test_parse_auto_command_rejects_shares():
+    is_auto, budget, err = serve_mod.parse_auto_command("/auto 10 shares")
+    assert (is_auto, budget) == (True, None)
+    assert "dollars" in err
+
+
+def test_parse_auto_command_rejects_garbage():
+    is_auto, budget, err = serve_mod.parse_auto_command("/auto loads of money")
+    assert (is_auto, budget) == (True, None)
+    assert "budget" in err
+
+
+@pytest.mark.parametrize(
     ("text", "is_chat", "question"),
     [
         ("/chat what's the risk?", True, "what's the risk?"),
@@ -340,6 +389,30 @@ def test_serve_loop_chat_answers(monkeypatch, tmp_path):
         asyncio.run(serve_mod.serve_loop(_config()))
 
     assert any("biggest risk is concentration" in s for s in ChatNotifier.instances[0].sent)
+
+
+def test_serve_loop_auto_dispatches(monkeypatch, tmp_path):
+    """/auto runs the autonomous loop with the current (paper) mode + budget."""
+    calls = []
+
+    def fake_run_auto(config, *, budget=None, trading_env=None, audit=None, on_step=None, stop_check=None):
+        calls.append((budget, trading_env))
+        return "📊 Auto done"
+
+    monkeypatch.setattr(serve_mod, "run_auto", fake_run_auto)
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class AutoNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/auto 500",))
+
+    _wire(monkeypatch, tmp_path, AutoNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert calls == [(500.0, "SIMULATE")]
+    assert any("Auto done" in s for s in AutoNotifier.instances[0].sent)
 
 
 def test_serve_loop_chat_without_research_nudges(monkeypatch, tmp_path):

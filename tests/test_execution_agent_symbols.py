@@ -2,7 +2,7 @@
 
 import pytest
 
-from execution_agent.symbols import to_moomoo, trd_market
+from execution_agent.symbols import to_moomoo, to_yahoo, trd_market
 
 
 @pytest.mark.parametrize(
@@ -82,3 +82,36 @@ def test_to_moomoo_rejects_non_string():
 )
 def test_trd_market(symbol, expected):
     assert trd_market(symbol) == expected
+
+
+@pytest.mark.parametrize(
+    ("moomoo_symbol", "expected"),
+    [
+        ("US.NVDA", "NVDA"),
+        ("HK.00700", "0700.HK"),
+        ("SH.600519", "600519.SS"),
+        ("SZ.000001", "000001.SZ"),
+        ("JP.7203", "7203.T"),
+        ("UK.VOD", "VOD.L"),
+        ("CA.SHOP", "SHOP.TO"),
+        ("AU.BHP", "BHP.AX"),
+        ("SG.D05", "D05.SI"),
+        ("KR.005930", "005930.KS"),
+    ],
+)
+def test_to_yahoo_maps_moomoo_back(moomoo_symbol, expected):
+    assert to_yahoo(moomoo_symbol) == expected
+
+
+@pytest.mark.parametrize(
+    "moomoo_symbol",
+    [
+        "NVDA",  # no market prefix
+        "",
+        "XX.NVDA",  # unknown market
+        None,
+    ],
+)
+def test_to_yahoo_rejects_unknown(moomoo_symbol):
+    with pytest.raises(ValueError):
+        to_yahoo(moomoo_symbol)

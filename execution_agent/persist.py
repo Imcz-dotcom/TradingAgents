@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import date
 
+from execution_agent.decision import DecisionResult
 from tradingagents.dataflows.files import locked
+from tradingagents.dataflows.symbols import normalize_symbol
 
 DEFAULT_HISTORY_PATH = os.path.join(
     os.path.expanduser("~"), ".tradingagents", "execution", "research_history.json"
@@ -89,3 +92,45 @@ def load_history() -> dict | None:
             return json.load(handle)
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def decision_from_entry(decision) -> DecisionResult | None:
+    """Rebuild a :class:`DecisionResult` from a persisted ``decision`` entry."""
+    if not isinstance(decision, dict):
+        return None
+    try:
+        return DecisionResult(
+            yahoo=decision["yahoo"],
+            moomoo=decision["moomoo"],
+            signal=decision["signal"],
+            side=decision["side"],
+            summary=decision.get("summary", ""),
+            cash=decision.get("cash"),
+            position_quantity=decision.get("position_quantity"),
+            research=decision.get("research") or {},
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def load_today_decision(yahoo: str) -> DecisionResult | None:
+    """A same-day research result for ``yahoo``, or None when absent or stale.
+
+    The serve bot persists every interactive research run to the shared per-day
+    history. The /auto loop reads the same file so a ticker researched earlier
+    today is reused instead of re-running the full pipeline. Only today's entries
+    count — a fresh date re-researches.
+    """
+    day = load_history()
+    if not isinstance(day, dict) or day.get("date") != date.today().isoformat():
+        return None
+    raw = day.get("researches") or {}
+    if not isinstance(raw, dict):
+        return None
+    for entry in raw.values():
+        if not isinstance(entry, dict):
+            continue
+        decision = entry.get("decision")
+        if isinstance(decision, dict) and normalize_symbol(str(decision.get("yahoo") or "")) == yahoo:
+            return decision_from_entry(decision)
+    return None

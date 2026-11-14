@@ -1,6 +1,9 @@
 """Per-day history persistence: JSON-safe subset and save/load round-trip."""
 
+from datetime import date
+
 from execution_agent import persist
+from execution_agent.decision import DecisionResult
 
 
 def _final_state():
@@ -68,3 +71,69 @@ def test_load_corrupt_returns_none(monkeypatch, tmp_path):
     monkeypatch.setattr(persist, "history_path", lambda: str(path))
 
     assert persist.load_history() is None
+
+
+# --- same-day reuse (load_today_decision) ---------------------------------
+
+
+def _entry(yahoo="NVDA", moomoo="US.NVDA", signal="Buy", side="BUY"):
+    return {
+        "executed": False,
+        "decision": {
+            "yahoo": yahoo,
+            "moomoo": moomoo,
+            "signal": signal,
+            "side": side,
+            "summary": "buy it",
+            "cash": None,
+            "position_quantity": None,
+            "research": {"investment_plan": "**Price Target**: 200.0\n\n**Time Horizon**: 3-6 months"},
+        },
+    }
+
+
+def _save(monkeypatch, tmp_path, researches, *, date_str=None):
+    monkeypatch.setattr(persist, "history_path", lambda: str(tmp_path / "hist.json"))
+    persist.save_history(
+        {"date": date_str or date.today().isoformat(), "researches": researches, "chat_history": []}
+    )
+
+
+def test_decision_from_entry_rebuilds():
+    d = persist.decision_from_entry(_entry()["decision"])
+
+    assert isinstance(d, DecisionResult)
+    assert d.yahoo == "NVDA"
+    assert d.signal == "Buy"
+    assert d.research["investment_plan"].startswith("**Price Target**")
+
+
+def test_decision_from_entry_malformed_is_none():
+    assert persist.decision_from_entry(None) is None
+    assert persist.decision_from_entry({"yahoo": "NVDA"}) is None  # missing keys
+
+
+def test_load_today_decision_finds_today(monkeypatch, tmp_path):
+    _save(monkeypatch, tmp_path, {"NVDA": _entry()})
+
+    d = persist.load_today_decision("NVDA")
+
+    assert d is not None and d.yahoo == "NVDA"
+
+
+def test_load_today_decision_matches_by_yahoo_not_key(monkeypatch, tmp_path):
+    _save(monkeypatch, tmp_path, {"some_key": _entry(yahoo="NVDA")})
+
+    assert persist.load_today_decision("NVDA") is not None
+
+
+def test_load_today_decision_stale_date_is_none(monkeypatch, tmp_path):
+    _save(monkeypatch, tmp_path, {"NVDA": _entry()}, date_str="2000-01-01")
+
+    assert persist.load_today_decision("NVDA") is None
+
+
+def test_load_today_decision_unknown_ticker_is_none(monkeypatch, tmp_path):
+    _save(monkeypatch, tmp_path, {"NVDA": _entry()})
+
+    assert persist.load_today_decision("AAPL") is None

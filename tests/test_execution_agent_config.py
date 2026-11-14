@@ -31,6 +31,45 @@ def test_defaults_are_safe():
     assert cfg.log_retention_days == 7
     assert cfg.telegram_bot_token is None
     assert cfg.telegram_chat_id is None
+    assert cfg.watchlist == ""
+    assert cfg.watchlist_tickers() == []
+    assert cfg.limit_price_band == 0.20
+    assert cfg.auto_underweight_trim == 0.50
+
+
+def test_watchlist_tickers_splits_strips_dedups():
+    cfg = ExecutionConfig(watchlist="NVDA, AAPL , NVDA, , 0700.HK")
+    assert cfg.watchlist_tickers() == ["NVDA", "AAPL", "0700.HK"]
+
+
+def test_watchlist_tickers_empty_when_unset():
+    assert ExecutionConfig(watchlist="").watchlist_tickers() == []
+    assert ExecutionConfig(watchlist=" , , ").watchlist_tickers() == []
+
+
+def test_env_override_watchlist_and_band(isolated_env):
+    isolated_env.setenv("EXECUTION_AGENT_WATCHLIST", "NVDA,AAPL")
+    isolated_env.setenv("EXECUTION_AGENT_LIMIT_PRICE_BAND", "0.10")
+    cfg = ExecutionConfig.from_env()
+    assert cfg.watchlist_tickers() == ["NVDA", "AAPL"]
+    assert cfg.limit_price_band == 0.10
+
+
+def test_validate_rejects_non_positive_limit_band():
+    with pytest.raises(ValueError):
+        ExecutionConfig(limit_price_band=0)
+
+
+def test_env_override_auto_underweight_trim(isolated_env):
+    isolated_env.setenv("EXECUTION_AGENT_AUTO_UNDERWEIGHT_TRIM", "0.25")
+    assert ExecutionConfig.from_env().auto_underweight_trim == 0.25
+
+
+def test_validate_rejects_out_of_range_auto_underweight_trim():
+    with pytest.raises(ValueError):
+        ExecutionConfig(auto_underweight_trim=0)
+    with pytest.raises(ValueError):
+        ExecutionConfig(auto_underweight_trim=1.5)
 
 
 def test_env_override_and_coercion(isolated_env):

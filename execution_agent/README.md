@@ -139,6 +139,82 @@ Now you drive everything from Telegram:
 One trade runs at a time. To stop the bot, press `Ctrl-C` in the laptop terminal.
 This is the same flow as `run` — the only difference is *where* you start it.
 
+### Fully-automatic `/auto` (paper only)
+
+`/auto` is a **daily-budget manager**. It reads your account, researches the
+universe, and acts by itself — no approval — but it *sizes by the research's
+conviction*, not a fixed amount:
+
+- **`/auto`** — "manage my account": research the watchlist + holdings and
+  sell/trim/hold per the analysis, but deploy **no new cash**.
+- **`/auto 500`** — "I have $500 today": split that budget across the buy ideas
+  by conviction (`Buy` earns twice an `Overweight`), buy at the trader's entry
+  price as a limit order, and place a protective stop-loss after a market fill.
+
+The **"what to buy" list** is your *watchlist* (`.env` `EXECUTION_AGENT_WATCHLIST`)
+**plus** your *current holdings*, read live from the account. So `/auto` manages
+what you own and, when you give it a budget, deploys the new cash across the
+watchlist ideas.
+
+```mermaid
+flowchart TD
+    Start([You: /auto — or /auto 500]) --> Read[Read account: cash + positions]
+    Read --> Universe[Universe = watchlist from .env<br/>+ current holdings]
+    Universe --> Research[Research each ticker]
+    Research --> Rating{Rating?}
+    Rating -->|Buy / Overweight| Budget{Budget given?}
+    Budget -->|yes| Split[Split budget by conviction<br/>Buy 2x, Overweight 1x]
+    Split --> Buy[BUY at entry price<br/>LIMIT — GTC or DAY by time horizon]
+    Budget -->|no| NoBuy[No new cash — skip buy]
+    Rating -->|Sell| Sell[SELL full exit at target]
+    Rating -->|Underweight| Trim[SELL a trim at target]
+    Rating -->|Hold / REVIEW| Hold[No order]
+    Buy --> Stop[After a market buy: protective stop-loss GTC]
+    Sell --> Save[Save today's verdict]
+    Trim --> Save
+    Hold --> Save
+    NoBuy --> Save
+    Stop --> Save
+```
+
+| Rating | Action |
+|---|---|
+| Buy / Overweight | BUY — split of the budget (Buy 2×, Overweight 1×) |
+| Hold | no order |
+| Underweight | SELL a **trim** (default half — see `AUTO_UNDERWEIGHT_TRIM`) |
+| Sell | SELL a **full exit** |
+
+Orders are **paper only**. It follows the research's own levels — buy at the
+trader's entry price, sell at the portfolio manager's price target — as limit
+orders (falling back to a market order when no usable level exists). After a
+*market* buy it also places a protective stop-loss at the trader's stop level; a
+pending limit buy just records the stop for a later run.
+
+Limit orders rest on Moomoo's side, so they survive the bot being offline — and
+the agent decides how long based on the research's own **Time Horizon**: a long
+call ("3-6 months") places a **GTC** order (rests until filled or cancelled), a
+short call ("1-2 weeks") places a **DAY** order. The protective stop-loss is
+always **GTC**. Because GTC orders can linger, each fresh run first **cancels
+the prior day's open orders** on each ticker before placing new ones, so a stale
+limit can't double-fill or fire against a superseded verdict.
+
+The verdict is saved to `~/.tradingagents/execution/auto_plan.json`, keyed by
+date (with the day's `budget`). Run `/auto` again the same day and it reuses
+that verdict; the next day it re-researches because the stored plan is stale.
+Separately, if you already researched a ticker interactively today (e.g. a
+morning `/run NVDA`), `/auto` reuses that same-day result instead of re-running
+the full pipeline — it still fetches a fresh live quote to size the order. That
+shared result lives in `~/.tradingagents/execution/research_history.json`.
+`/auto` refuses to run in `REAL` mode — it is paper-only by design.
+
+```bash
+# Optional — which tickers /auto researches each day (unset: holdings only)
+EXECUTION_AGENT_WATCHLIST=NVDA,AAPL
+
+# Optional — an "Underweight" sell trims to this fraction of the position
+EXECUTION_AGENT_AUTO_UNDERWEIGHT_TRIM=0.50
+```
+
 ## How it maps decisions to orders
 
 | TradingAgents rating | Action |
@@ -148,9 +224,12 @@ This is the same flow as `run` — the only difference is *where* you start it.
 | Hold | no order |
 | REVIEW | never trade |
 
-Orders are **market** orders only — the quantity is the only number sent, and
-*you* choose the quantity in chat. The agent never parses numbers out of the
-LLM's prose.
+Orders are **market** orders in the interactive flow — the quantity is the only
+number sent, and *you* choose the quantity in chat. The agent never parses
+numbers out of the LLM's prose there. `/auto` is the exception: it places
+**limit** orders at the research's own structured levels (entry price / price
+target), since those come from the trader and portfolio-manager schemas rather
+than free text.
 
 ## Supported symbols
 

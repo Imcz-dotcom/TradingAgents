@@ -62,6 +62,14 @@ class ExecutionConfig:
     log_retention_days: int = 7
     # JSON-encoded rating -> side override, e.g. '{"Buy": "SELL"}' (testing only).
     side_mapping: str | None = None
+    # Comma-separated Yahoo tickers the /auto loop researches each day.
+    watchlist: str = ""
+    # An LLM-provided price farther than this fraction from the live price is
+    # rejected as a hallucination and the order falls back to MARKET.
+    limit_price_band: float = 0.20
+    # /auto: an "Underweight" sell trims to this fraction of the position (a
+    # "Sell" is always a full exit). Lets /auto reduce without dumping it all.
+    auto_underweight_trim: float = 0.50
 
     def __post_init__(self) -> None:
         self.validate()
@@ -75,8 +83,31 @@ class ExecutionConfig:
             raise ValueError(f"sizing_amount must be positive, got {self.sizing_amount!r}")
         if self.log_retention_days <= 0:
             raise ValueError(f"log_retention_days must be positive, got {self.log_retention_days!r}")
+        if self.limit_price_band <= 0:
+            raise ValueError(f"limit_price_band must be positive, got {self.limit_price_band!r}")
+        if not 0 < self.auto_underweight_trim <= 1:
+            raise ValueError(
+                f"auto_underweight_trim must be in (0, 1], got {self.auto_underweight_trim!r}"
+            )
         if self.side_mapping is not None:
             self.parsed_side_mapping()  # raises on invalid JSON / shape
+
+    def watchlist_tickers(self) -> list[str]:
+        """The watchlist as a deduped, order-preserving list of tickers.
+
+        Empty when ``watchlist`` is unset, so the /auto universe degrades to the
+        current positions only.
+        """
+        if not self.watchlist:
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        for part in self.watchlist.split(","):
+            ticker = part.strip()
+            if ticker and ticker not in seen:
+                seen.add(ticker)
+                out.append(ticker)
+        return out
 
     def parsed_side_mapping(self) -> dict[str, str] | None:
         """The rating -> side override as a dict, or None when unset."""
