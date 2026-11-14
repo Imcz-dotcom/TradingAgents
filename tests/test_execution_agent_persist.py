@@ -137,3 +137,39 @@ def test_load_today_decision_unknown_ticker_is_none(monkeypatch, tmp_path):
     _save(monkeypatch, tmp_path, {"NVDA": _entry()})
 
     assert persist.load_today_decision("AAPL") is None
+
+
+def test_save_auto_researches_merges_and_preserves_chat(monkeypatch, tmp_path):
+    monkeypatch.setattr(persist, "history_path", lambda: str(tmp_path / "hist.json"))
+    persist.save_history({
+        "date": date.today().isoformat(),
+        "researches": {"NVDA": _entry()},
+        "chat_history": [{"ticker": "NVDA", "q": "q", "a": "a"}],
+    })
+
+    d = DecisionResult(
+        yahoo="AAPL", moomoo="US.AAPL", signal="Sell", side="SELL",
+        summary="avoid", cash=None, position_quantity=None, research={},
+    )
+    persist.save_auto_researches([d])
+
+    day = persist.load_history()
+    assert set(day["researches"]) == {"NVDA", "AAPL"}
+    assert day["chat_history"] == [{"ticker": "NVDA", "q": "q", "a": "a"}]
+    assert day["researches"]["AAPL"]["decision"]["signal"] == "Sell"
+    assert day["researches"]["NVDA"]["decision"]["signal"] == "Buy"  # untouched
+
+
+def test_save_auto_researches_resets_stale_day(monkeypatch, tmp_path):
+    monkeypatch.setattr(persist, "history_path", lambda: str(tmp_path / "hist.json"))
+    persist.save_history({"date": "2000-01-01", "researches": {"NVDA": _entry()}, "chat_history": []})
+
+    d = DecisionResult(
+        yahoo="AAPL", moomoo="US.AAPL", signal="Sell", side="SELL",
+        summary="avoid", cash=None, position_quantity=None, research={},
+    )
+    persist.save_auto_researches([d])
+
+    day = persist.load_history()
+    assert day["date"] == date.today().isoformat()  # stale day discarded
+    assert set(day["researches"]) == {"AAPL"}

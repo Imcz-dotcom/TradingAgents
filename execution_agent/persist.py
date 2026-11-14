@@ -134,3 +134,38 @@ def load_today_decision(yahoo: str) -> DecisionResult | None:
         if isinstance(decision, dict) and normalize_symbol(str(decision.get("yahoo") or "")) == yahoo:
             return decision_from_entry(decision)
     return None
+
+
+def save_auto_researches(decisions) -> None:
+    """Merge ``/auto``'s decisions into today's shared history.
+
+    ``/auto`` researches the whole universe and places its own orders; folding
+    those runs into the same per-day store the interactive ``/research`` flow
+    writes means ``/chat`` can answer about them and a later ``/auto`` run
+    reuses them. Existing ``chat_history`` is preserved; a ticker already
+    researched today is overwritten with this run's decision.
+    """
+    day = load_history()
+    if not isinstance(day, dict) or day.get("date") != date.today().isoformat():
+        day = {"date": date.today().isoformat(), "researches": {}, "chat_history": []}
+    researches = day.get("researches")
+    if not isinstance(researches, dict):
+        researches = {}
+        day["researches"] = researches
+    for d in decisions:
+        if d is None:
+            continue
+        researches[normalize_symbol(d.yahoo)] = {
+            "executed": False,
+            "decision": {
+                "yahoo": d.yahoo,
+                "moomoo": d.moomoo,
+                "signal": d.signal,
+                "side": d.side,
+                "summary": d.summary,
+                "cash": d.cash,
+                "position_quantity": d.position_quantity,
+                "research": research_subset(d.research),
+            },
+        }
+    save_history(day)

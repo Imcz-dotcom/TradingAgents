@@ -128,16 +128,21 @@ shows `(.venv)`.)
 
 Now you drive everything from Telegram:
 
-1. Send a ticker — `NVDA`, `0700.HK`, or `/run NVDA`.
-2. The bot runs the research, posting a one-line update on Telegram as each phase
-   finishes (📊 market → 💬 sentiment → 📰 news → 🏦 fundamentals → ⚖️ debate →
-   🎯 trader → 🛡️ risk → ✅ final), then asks *"How much?"* and dollars/shares,
-   then **Approve / Reject**.
+1. Send a ticker — `NVDA`, `0700.HK`, or `/run NVDA`. The bot researches it,
+   posting a one-line update on Telegram as each phase finishes (📊 market → 💬
+   sentiment → 📰 news → 🏦 fundamentals → ⚖️ debate → 🎯 trader → 🛡️ risk →
+   ✅ final), then replies with the call and summary. It **saves** the result but
+   does **not** trade yet.
+2. Send `/execute` to trade the most recent research of the day, or
+   `/execute NVDA` to trade a specific one. The bot then asks *"How much?"* and
+   dollars/shares, then **Approve / Reject**.
 3. Tap **Approve** to place the order; the bot then goes back to listening for
    the next ticker.
 
-One trade runs at a time. To stop the bot, press `Ctrl-C` in the laptop terminal.
-This is the same flow as `run` — the only difference is *where* you start it.
+`/execute <ticker>` refuses a ticker that hasn't been researched yet — send the
+ticker first, then execute it. One trade runs at a time. To stop the bot, press
+`Ctrl-C` in the laptop terminal. This is the same flow as `run` — the only
+difference is *where* you start it.
 
 ### Fully-automatic `/auto` (paper only)
 
@@ -199,12 +204,19 @@ the prior day's open orders** on each ticker before placing new ones, so a stale
 limit can't double-fill or fire against a superseded verdict.
 
 The verdict is saved to `~/.tradingagents/execution/auto_plan.json`, keyed by
-date (with the day's `budget`). Run `/auto` again the same day and it reuses
-that verdict; the next day it re-researches because the stored plan is stale.
+date (with the day's `budget`). Run `/auto` again the same day and it re-checks
+the watchlist: tickers it already researched today are left alone, but a newly
+added watchlist ticker — or one an earlier run missed — is researched and folded
+in. So editing `EXECUTION_AGENT_WATCHLIST` mid-day takes effect on the next
+`/auto`, not just tomorrow. On a fresh day it re-researches everything.
 Separately, if you already researched a ticker interactively today (e.g. a
 morning `/run NVDA`), `/auto` reuses that same-day result instead of re-running
 the full pipeline — it still fetches a fresh live quote to size the order. That
 shared result lives in `~/.tradingagents/execution/research_history.json`.
+`/auto`'s own research is saved to that same store too, so `/chat` can answer
+questions about any ticker `/auto` looked at — including cross-ticker ones like
+"how does NVDA compare to AAPL?" (`/chat` shows the full research for the ticker
+you ask about and a one-line digest for the rest of today's runs).
 `/auto` refuses to run in `REAL` mode — it is paper-only by design.
 
 ```bash

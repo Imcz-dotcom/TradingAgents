@@ -28,6 +28,7 @@ it in a worker thread and passes ``on_step`` (progress) and ``stop_check``
 from __future__ import annotations
 
 import math
+import re
 from datetime import date
 
 from execution_agent import auto_plan, persist, state
@@ -159,6 +160,26 @@ def decide_action(
     }
 
 
+def _short_why(summary) -> str:
+    """The decision's executive summary, trimmed to one short reason line.
+
+    A flat book renders an "avoid" call as a one-liner; this pulls just the
+    portfolio manager's opening summary (rating's reasoning) so the message says
+    *why* the ticker was skipped rather than "sell called" against nothing.
+    """
+    if not summary:
+        return ""
+    m = re.search(r"\*\*Executive Summary\*\*:\s*(.+)", str(summary), re.DOTALL)
+    if not m:
+        return ""
+    text = m.group(1)
+    cutoff = re.search(r"\*\*Investment Thesis\*\*", text)
+    if cutoff:
+        text = text[: cutoff.start()]
+    text = " ".join(text.split())
+    return text if len(text) <= 120 else text[:120].rstrip() + "…"
+
+
 def _entry_line(entry: dict) -> str:
     """One plan entry as a single Telegram line."""
     ticker = entry["ticker"]
@@ -181,7 +202,9 @@ def _entry_line(entry: dict) -> str:
     if reason == "review":
         return f"⚠️ {ticker}: REVIEW — skipped"
     if reason == "no_position":
-        return f"➖ {ticker}: sell called but no position — skipped"
+        signal = entry.get("signal") or "avoid"
+        why = _short_why(entry.get("summary"))
+        return f"➖ {ticker}: {signal} — no position to act on" + (f" · {why}" if why else "")
     if reason == "no_budget":
         return f"➖ {ticker}: buy called but no budget — skipped"
     if reason == "no_price":
@@ -238,12 +261,6 @@ def run_auto(
 
     today = date.today().isoformat()
 
-    # Refer-back: a same-day plan is reused, not re-researched (the user's
-    # "date-aware" memory). A stale date means the stored verdict is outdated.
-    stored = auto_plan.load_plan()
-    if isinstance(stored, dict) and stored.get("date") == today:
-        return "📚 Already ran /auto today — reusing today's plan (nothing re-researched):\n\n" + _summarize(stored)
-
     broker = MoomooBroker(
         host=config.moomoo_host, port=config.moomoo_port, trading_env=trading_env
     )
@@ -265,26 +282,48 @@ def run_auto(
     )
 
     # Universe = watchlist ∪ current holdings, deduped, order preserved.
-    universe: list[str] = []
+    full_universe: list[str] = []
     seen: set[str] = set()
     for ticker in config.watchlist_tickers() + [p.ticker for p in book.positions]:
         key = ticker.upper()
         if key not in seen:
             seen.add(key)
-            universe.append(ticker)
+            full_universe.append(ticker)
 
-    plan_entries: list[dict] = []
+    # Refer-back: a same-day plan is reused rather than re-researched — but not
+    # blindly. The watchlist may have grown, or an earlier (pre-sharing) run may
+    # have saved a ticker to the plan without reaching the /chat store. So the
+    # tickers already held in the shared store are skipped; the rest (a new
+    # watchlist entry, or a plan ticker missing from the store) are researched
+    # now and folded into today's plan.
+    stored = auto_plan.load_plan()
+    carried_plan: list[dict] = []
+    if isinstance(stored, dict) and stored.get("date") == today:
+        shared = persist.load_history() or {}
+        shared_symbols = {str(k).upper() for k in (shared.get("researches") or {})}
+        to_research = [t for t in full_universe if t.upper() not in shared_symbols]
+        carried_plan = [
+            e for e in (stored.get("plan") or [])
+            if str(e.get("ticker") or "").upper() in shared_symbols
+        ]
+        if not to_research:
+            return "📚 Already ran /auto today — nothing new to research (watchlist unchanged):\n\n" + _summarize(stored)
+    else:
+        to_research = full_universe
+
+    plan_entries: list[dict] = carried_plan
     graph = TradingAgentsGraph(debug=False, config=DEFAULT_CONFIG.copy())
 
     def _stop_and_save() -> str:
-        day = _make_day(today, acct, book, universe, plan_entries, budget)
+        persist.save_auto_researches([c["decision"] for c in candidates])
+        day = _make_day(today, acct, book, full_universe, plan_entries, budget)
         auto_plan.save_plan(day)
         return "🛑 Stopped during /auto — partial plan saved, no further orders.\n\n" + _summarize(day)
 
     # Pass 1 — research every ticker first, so the budget can be split by
     # conviction across *all* the buy ideas before any order goes out.
     candidates: list[dict] = []
-    for ticker in universe:
+    for ticker in to_research:
         if stop_check is not None and stop_check():
             return _stop_and_save()
 
@@ -325,6 +364,10 @@ def run_auto(
         live = _live_price(broker, decision.moomoo) if decision.side is not None else None
         horizon = parse_time_horizon(decision.research)
         candidates.append({"decision": decision, "prices": prices, "live": live, "horizon": horizon})
+
+    # Share the day's research with /chat (and future /auto reuse) as soon as it
+    # exists, so an error later in the loop can't lose it.
+    persist.save_auto_researches([c["decision"] for c in candidates])
 
     # Pass 2 — split the budget across buy candidates by conviction, then decide.
     buys = [
@@ -446,7 +489,7 @@ def run_auto(
             }
         )
 
-    day = _make_day(today, acct, book, universe, plan_entries, budget)
+    day = _make_day(today, acct, book, full_universe, plan_entries, budget)
     auto_plan.save_plan(day)
     return _summarize(day)
 

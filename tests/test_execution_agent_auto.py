@@ -61,6 +61,20 @@ def test_allocate_budget_empty_and_no_budget():
     assert auto.allocate_budget([("NVDA", 0.0)], 600.0) == {}
 
 
+def test_short_why_extracts_executive_summary():
+    summary = (
+        "**Rating**: Sell\n\n"
+        "**Executive Summary**: Stay flat; do not initiate.\n\n"
+        "**Investment Thesis**: a long thesis"
+    )
+    assert auto._short_why(summary) == "Stay flat; do not initiate."
+
+
+def test_short_why_missing_is_empty():
+    assert auto._short_why(None) == ""
+    assert auto._short_why("**Rating**: Buy") == ""
+
+
 def _decision(yahoo="NVDA", signal="Buy", side="BUY", summary="buy it", research=None):
     return DecisionResult(
         yahoo=yahoo,
@@ -228,19 +242,93 @@ def test_run_auto_refuses_real_mode():
     assert "paper-only" in result
 
 
-def test_run_auto_reuses_same_day_plan(monkeypatch, tmp_path):
-    monkeypatch.setattr(auto.auto_plan, "auto_plan_path", lambda: str(tmp_path / "plan.json"))
+def test_run_auto_reuses_same_day_plan(patched):
+    broker = _FakeBroker()
+    apply, calls = patched
+    apply(broker, {}, _prices())
+
+    # NVDA is already in the shared store *and* in today's plan — nothing new,
+    # so a same-day re-run must skip research entirely.
     auto.auto_plan.save_plan(
         {"date": date.today().isoformat(), "cash": 5000.0, "currency": "USD",
-         "positions": [], "universe": [], "plan": []}
+         "positions": [], "universe": ["NVDA"],
+         "plan": [{"ticker": "NVDA", "side": None, "reason": "hold", "signal": "Hold"}]}
     )
-    monkeypatch.setattr(
-        auto, "run_decision_streaming", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not research"))
+    persist.save_history({
+        "date": date.today().isoformat(),
+        "researches": {"NVDA": {"executed": False, "decision": {
+            "yahoo": "NVDA", "moomoo": "US.NVDA", "signal": "Hold", "side": None,
+            "summary": "", "cash": None, "position_quantity": None, "research": {},
+        }}},
+        "chat_history": [],
+    })
+
+    result = auto.run_auto(ExecutionConfig(watchlist="NVDA"))
+
+    assert calls == []
+    assert "nothing new to research" in result
+
+
+def test_run_auto_researches_new_watchlist_ticker_on_same_day(patched):
+    broker = _FakeBroker(last=200.0)
+    decisions = {"AAPL": _decision(yahoo="AAPL", signal="Buy", side="BUY")}
+    apply, calls = patched
+    apply(broker, decisions, _prices(entry=200.0))
+
+    # Today's plan already covers NVDA, and the shared store holds NVDA too —
+    # so a same-day re-run must leave NVDA alone and only research the new AAPL.
+    auto.auto_plan.save_plan(
+        {"date": date.today().isoformat(), "cash": 5000.0, "currency": "USD",
+         "positions": [], "universe": ["NVDA"],
+         "plan": [{"ticker": "NVDA", "side": None, "reason": "hold", "signal": "Hold"}]}
     )
+    persist.save_history({
+        "date": date.today().isoformat(),
+        "researches": {"NVDA": {"executed": False, "decision": {
+            "yahoo": "NVDA", "moomoo": "US.NVDA", "signal": "Hold", "side": None,
+            "summary": "", "cash": None, "position_quantity": None, "research": {},
+        }}},
+        "chat_history": [],
+    })
 
-    result = auto.run_auto(ExecutionConfig())
+    auto.run_auto(ExecutionConfig(watchlist="NVDA,AAPL"), budget=400.0)
 
-    assert "reusing today's plan" in result
+    assert calls == ["AAPL"]
+    plan = auto.auto_plan.load_plan()
+    assert plan["universe"] == ["NVDA", "AAPL"]  # full universe, order preserved
+    assert [e["ticker"] for e in plan["plan"]] == ["NVDA", "AAPL"]  # carried + new
+
+
+def test_run_auto_re_researches_plan_ticker_missing_from_store(patched):
+    broker = _FakeBroker(last=200.0)
+    decisions = {"AAPL": _decision(yahoo="AAPL", signal="Sell", side="SELL")}
+    apply, calls = patched
+    apply(broker, decisions, _prices(entry=200.0))
+
+    # The plan covers both tickers, but only NVDA reached the shared store (a
+    # pre-sharing run). AAPL must be re-researched to fill the /chat gap.
+    auto.auto_plan.save_plan(
+        {"date": date.today().isoformat(), "cash": 5000.0, "currency": "USD",
+         "positions": [], "universe": ["NVDA", "AAPL"],
+         "plan": [
+             {"ticker": "NVDA", "side": None, "reason": "hold", "signal": "Hold"},
+             {"ticker": "AAPL", "side": "SELL", "reason": "no_position", "signal": "Sell"},
+         ]}
+    )
+    persist.save_history({
+        "date": date.today().isoformat(),
+        "researches": {"NVDA": {"executed": False, "decision": {
+            "yahoo": "NVDA", "moomoo": "US.NVDA", "signal": "Hold", "side": None,
+            "summary": "", "cash": None, "position_quantity": None, "research": {},
+        }}},
+        "chat_history": [],
+    })
+
+    auto.run_auto(ExecutionConfig(watchlist="NVDA,AAPL"))
+
+    assert calls == ["AAPL"]
+    plan = auto.auto_plan.load_plan()
+    assert [e["ticker"] for e in plan["plan"]] == ["NVDA", "AAPL"]
 
 
 def test_run_auto_researches_stale_plan(patched, tmp_path):

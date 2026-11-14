@@ -44,7 +44,22 @@ def test_build_prompt_labels_cross_ticker_history():
         {"ticker": "INTC", "q": "what now?", "a": "hold"},
         {"ticker": "NVDA", "q": "risk?", "a": "concentration"},
     ]
-    prompt = chat.build_prompt(state, "NVDA", history, "confirm?")
+    prompt = chat.build_prompt({"NVDA": state}, "NVDA", history, "confirm?")
     assert "Q (about INTC): what now?" in prompt
     assert "Q: risk?" in prompt
     assert "A: concentration" in prompt
+
+
+def test_build_prompt_includes_other_tickers_digest():
+    researches = {
+        "NVDA": {"final_trade_decision": "**Rating**: Buy\n\n**Executive Summary**: Buy it.\n\n**Investment Thesis**: nvidia thesis"},
+        "AAPL": {"final_trade_decision": "**Rating**: Sell\n\n**Executive Summary**: Avoid it.\n\n**Investment Thesis**: apple thesis"},
+    }
+    prompt = chat.build_prompt(researches, "NVDA", [], "why skip AAPL?")
+    assert "## Other tickers researched today" in prompt
+    assert "### AAPL" in prompt
+    assert "**Rating**: Sell" in prompt
+    assert "Avoid it." in prompt
+    # The other ticker's long thesis is dropped from the digest; the target's is kept.
+    assert "apple thesis" not in prompt
+    assert "nvidia thesis" in prompt

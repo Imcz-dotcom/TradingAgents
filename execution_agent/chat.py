@@ -89,14 +89,52 @@ def research_transcript(final_state: dict) -> str:
     return "\n\n".join(parts)
 
 
-def build_prompt(final_state: dict, ticker: str, history: list[dict], question: str) -> str:
-    """One chat turn's prompt: the research, the Q&A so far, then the question.
+def _compact_decision(final_state: dict) -> str:
+    """A short cross-ticker digest: the rating + executive summary, thesis dropped.
+
+    The full transcript for several tickers would not fit a chat prompt, so every
+    ticker other than the one being asked about contributes just its decision's
+    opening (rating + executive summary) — enough to compare calls or answer
+    "why was X skipped?" without shipping whole debates.
+    """
+    decision = _text(final_state.get("final_trade_decision"))
+    if not decision:
+        return ""
+    cutoff = decision.find("**Investment Thesis**")
+    if cutoff != -1:
+        decision = decision[:cutoff]
+    decision = decision.strip()
+    return decision if len(decision) <= 400 else decision[:400].rstrip() + "…"
+
+
+def build_prompt(researches: dict, ticker: str, history: list[dict], question: str) -> str:
+    """One chat turn's prompt: the target's full research, a digest of the rest,
+    the Q&A so far, then the question.
+
+    ``researches`` maps each ticker researched today to its final state. The
+    target ``ticker`` gets the full transcript; every other ticker gets a compact
+    digest so cross-ticker questions ("how does NVDA compare to AAPL?") can be
+    answered without the whole day's transcripts.
 
     ``history`` is the day's whole conversation (not just this ticker's), as
     ``{"ticker", "q", "a"}`` entries. A turn about a different ticker is labelled
     so the assistant can tell which research a past answer drew on.
     """
-    transcript = research_transcript(final_state)
+    target = researches.get(ticker) or {} if isinstance(researches, dict) else {}
+    transcript = research_transcript(target)
+
+    others_block = ""
+    if isinstance(researches, dict):
+        others = []
+        for t in researches:
+            if t == ticker:
+                continue
+            digest = _compact_decision(researches.get(t) or {})
+            if digest:
+                others.append(f"### {t}\n{digest}")
+        if others:
+            others_block = "## Other tickers researched today\n" + "\n\n".join(others) + "\n\n"
+
     history_block = ""
     if history:
         lines = []
@@ -115,12 +153,13 @@ def build_prompt(final_state: dict, ticker: str, history: list[dict], question: 
         "guessing. Be concise and specific, and say which report or debate a "
         "claim comes from.\n\n"
         f"## Full research on {ticker}\n{transcript}\n\n"
+        f"{others_block}"
         f"{history_block}\n\n"
         f"## Question\n{question}"
     )
 
 
-def answer(final_state: dict, ticker: str, history: list[dict], question: str) -> str:
+def answer(researches: dict, ticker: str, history: list[dict], question: str) -> str:
     """Answer one question about the research, returning the model's reply."""
-    result = _deep_llm().invoke(build_prompt(final_state, ticker, history, question)).content
+    result = _deep_llm().invoke(build_prompt(researches, ticker, history, question)).content
     return result if isinstance(result, str) else str(result)

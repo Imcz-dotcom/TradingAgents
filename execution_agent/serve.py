@@ -4,9 +4,11 @@ Run ``czagent serve`` and leave the laptop running. From your phone you can:
 
   ``NVDA`` / ``/research NVDA`` — run the research, store the full result, and
                                   send the summary + AI's Buy/Sell. No order.
-  ``/execute``               — run the approval flow on the latest research of
-                                  the day (direction -> amount -> dollars/shares
-                                  -> Approve/Reject), exactly like ``run``.
+  ``/execute [ticker]``      — run the approval flow on a ticker's research
+                                  (the latest when you omit the ticker): direction
+                                  -> amount -> dollars/shares -> Approve/Reject,
+                                  exactly like ``run``. Refuses a ticker that
+                                  hasn't been researched yet.
   ``/chat <question>``       — ask a question about today's research (the bot
                                   answers from the full reports/debates, not the
                                   one-line summary). Multi-turn, remembers the
@@ -54,8 +56,9 @@ _COMMAND_RE = re.compile(
 # "/mode", "/mode paper", "/mode real" — query or switch the trading environment.
 _MODE_RE = re.compile(r"^\s*/mode\b\s*(?P<arg>paper|real)?\s*$", re.IGNORECASE)
 
-# "/execute" — run the approval flow on the latest stored research.
-_EXECUTE_RE = re.compile(r"^\s*/execute\b", re.IGNORECASE)
+# "/execute [ticker]" — run the approval flow on a ticker's stored research.
+# No ticker means the latest research of the day.
+_EXECUTE_RE = re.compile(r"^\s*/execute\b\s*(?P<ticker>[A-Za-z0-9.]+)?", re.IGNORECASE)
 
 # "/auto" — run the fully-automatic paper-trading loop (no human approval).
 _AUTO_RE = re.compile(r"^\s*/auto\b", re.IGNORECASE)
@@ -106,9 +109,18 @@ def parse_mode_command(text: str) -> tuple[bool, str | None]:
     return True, (arg.lower() if arg else None)
 
 
-def is_execute_command(text: str) -> bool:
-    """Whether ``text`` is an "/execute" request (run the approval flow)."""
-    return isinstance(text, str) and bool(_EXECUTE_RE.match(text.strip()))
+def parse_execute_command(text: str) -> tuple[bool, str | None]:
+    """Parse an "/execute [ticker]" message -> ``(is_execute, ticker)``.
+
+    ``ticker`` is the ticker to execute (``None`` = the latest research of the
+    day), or ``None`` when ``text`` isn't an /execute command.
+    """
+    if not isinstance(text, str):
+        return False, None
+    m = _EXECUTE_RE.match(text.strip())
+    if m is None:
+        return False, None
+    return True, m.group("ticker") or None
 
 
 def is_auto_command(text: str) -> bool:
@@ -412,11 +424,22 @@ async def serve_loop(config: ExecutionConfig) -> None:
             state.append_event(audit, {"event": "error", "message": str(exc)})
             await notifier.send(f"❌ {exc}")
 
-    async def handle_execute() -> None:
+    async def handle_execute(ticker: str | None = None) -> None:
         if not researches:
             await notifier.send("No research yet — send a ticker or `/research NVDA` first.")
             return
-        ticker = next(reversed(researches))  # the latest research of the day
+        if ticker is None:
+            ticker = next(reversed(researches))  # the latest research of the day
+        else:
+            # `/execute WDC` targets a specific run; it must exist first.
+            match = next((t for t in researches if t.upper() == ticker.upper()), None)
+            if match is None:
+                await notifier.send(
+                    f"No research on {ticker.upper()} yet — research it first "
+                    f"(send `{ticker}` or `/research {ticker}`), then `/execute {ticker}`."
+                )
+                return
+            ticker = match
         res = researches[ticker]
         if res.decision.side is None:
             await notifier.send(
@@ -448,11 +471,11 @@ async def serve_loop(config: ExecutionConfig) -> None:
                 "— or name a ticker: `/chat NVDA what's the risk?`"
             )
             return
-        res = researches[ticker]
         typer.echo(f"💬 {ticker}: answering — {question}")
         try:
+            all_research = {t: r.decision.research for t, r in researches.items()}
             answer = await asyncio.to_thread(
-                chat.answer, res.decision.research, ticker, chat_history, question
+                chat.answer, all_research, ticker, chat_history, question
             )
         except Exception as exc:  # noqa: BLE001 — a chat failure must not kill the bot
             await notifier.send(f"❌ Chat failed: {exc}")
@@ -503,6 +526,12 @@ async def serve_loop(config: ExecutionConfig) -> None:
 
         if runner.done():
             summary = runner.result()  # may itself be a "stopped" summary
+            # /auto saved its research to the shared history; pull it into live
+            # memory so /chat can answer about those tickers without a restart.
+            loaded = persist.load_history()
+            if isinstance(loaded, dict) and loaded.get("date") == date.today().isoformat():
+                refreshed, _ = _history_to_day(loaded)
+                researches.update(refreshed)
         else:
             runner.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -537,8 +566,9 @@ async def serve_loop(config: ExecutionConfig) -> None:
                 else:
                     await notifier.send(f"Kept {mode_label(mode)}.")
             continue
-        if is_execute_command(text):
-            await handle_execute()
+        is_execute, exec_ticker = parse_execute_command(text)
+        if is_execute:
+            await handle_execute(exec_ticker)
             continue
         if is_auto_command(text):
             _, budget, err = parse_auto_command(text)

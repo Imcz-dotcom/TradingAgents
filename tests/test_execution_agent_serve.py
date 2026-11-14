@@ -64,16 +64,26 @@ def test_parse_mode_command(text, is_mode, arg):
 
 
 @pytest.mark.parametrize(
-    "text",
-    ["/execute", "/EXECUTE", "/execute now", "  /execute  "],
+    ("text", "expected"),
+    [
+        ("/execute", (True, None)),
+        ("/EXECUTE", (True, None)),
+        ("  /execute  ", (True, None)),
+        ("/execute WDC", (True, "WDC")),
+        ("/execute 0700.HK", (True, "0700.HK")),
+        ("/execute now", (True, "now")),
+    ],
 )
-def test_is_execute_command_true(text):
-    assert serve_mod.is_execute_command(text) is True
+def test_parse_execute_command(text, expected):
+    assert serve_mod.parse_execute_command(text) == expected
 
 
-@pytest.mark.parametrize("text", ["execute", "NVDA", "/run NVDA", "/chat hi", "", None])
-def test_is_execute_command_false(text):
-    assert serve_mod.is_execute_command(text) is False
+@pytest.mark.parametrize(
+    "text",
+    ["execute", "NVDA", "/run NVDA", "/chat hi", "/auto", "", None],
+)
+def test_parse_execute_command_not_execute(text):
+    assert serve_mod.parse_execute_command(text) == (False, None)
 
 
 @pytest.mark.parametrize(
@@ -371,6 +381,55 @@ def test_serve_loop_execute_without_research_nudges(monkeypatch, tmp_path):
         asyncio.run(serve_mod.serve_loop(_config()))
 
     assert any("No research yet" in s for s in ExecuteOnlyNotifier.instances[0].sent)
+
+
+def test_serve_loop_execute_targets_named_ticker(monkeypatch, tmp_path):
+    """/execute WDC trades WDC even when INTC is the latest research."""
+    placed = []
+
+    async def fake_approve_and_place(notifier, config, decision, audit, dry_run, trading_env=None):
+        placed.append(decision.yahoo)
+        return "✅ Order placed: 123 (SUBMITTED)"
+
+    monkeypatch.setattr(serve_mod, "approve_and_place", fake_approve_and_place)
+
+    class NamedExecuteNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("NVDA", "INTC", "/execute NVDA"))
+
+    _wire(monkeypatch, tmp_path, NamedExecuteNotifier)
+    monkeypatch.setattr(
+        serve_mod, "run_decision_streaming", lambda graph, ticker, *a, **k: _decision_for(ticker)
+    )
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert placed == ["NVDA"]  # the named ticker, not the latest (INTC)
+
+
+def test_serve_loop_execute_unknown_ticker_refuses(monkeypatch, tmp_path):
+    """/execute on a ticker that was never researched is refused, not traded."""
+    placed = []
+
+    async def fake_approve_and_place(notifier, config, decision, audit, dry_run, trading_env=None):
+        placed.append(decision.yahoo)
+        return "✅ Order placed"
+
+    monkeypatch.setattr(serve_mod, "approve_and_place", fake_approve_and_place)
+
+    class UnknownExecuteNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("NVDA", "/execute AAPL"))
+
+    _wire(monkeypatch, tmp_path, UnknownExecuteNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert placed == []  # nothing was approved
+    sent = UnknownExecuteNotifier.instances[0].sent
+    assert any("No research on AAPL yet" in s for s in sent)
 
 
 def test_serve_loop_chat_answers(monkeypatch, tmp_path):
@@ -784,5 +843,7 @@ def test_serve_loop_drops_raw_messages_from_in_memory_research(monkeypatch, tmp_
     with pytest.raises(RuntimeError, match="stop"):
         asyncio.run(serve_mod.serve_loop(_config()))
 
-    assert seen and "messages" not in seen[0]
-    assert "market_report" in seen[0]
+    assert seen and isinstance(seen[0], dict)
+    nvda = seen[0].get("NVDA") or {}
+    assert "messages" not in nvda
+    assert "market_report" in nvda
