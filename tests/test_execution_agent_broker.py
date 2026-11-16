@@ -310,11 +310,33 @@ def test_get_account(fake_moomoo):
 
     result = broker.get_account()
 
-    assert result == {"cash": 10000.0, "currency": "USD"}
+    assert result == {
+        "cash": 10000.0,
+        "currency": "USD",
+        "total_assets": None,  # column absent in this account snapshot
+        "market_value": None,
+    }
     trade = fake_moomoo["created"][0]
     assert trade.accinfo_args["trd_env"] == "SIMULATE"
     assert trade.accinfo_args["acc_id"] == 123
     assert trade.closed is True
+
+
+def test_get_account_includes_worth_when_present(fake_moomoo):
+    fake_moomoo["accinfo_data"] = pd.DataFrame(
+        {
+            "cash": [10000.0],
+            "currency": ["USD"],
+            "total_assets": [15000.0],
+            "market_val": [5000.0],
+        }
+    )
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    result = broker.get_account()
+
+    assert result["total_assets"] == 15000.0
+    assert result["market_value"] == 5000.0
 
 
 def test_get_account_raises_on_no_account(fake_moomoo):
@@ -337,13 +359,36 @@ def test_get_positions_translates_symbols(fake_moomoo):
 
     result = broker.get_positions()
 
-    assert result == [
-        {"symbol": "NVDA", "quantity": 5.0, "average_price": 100.0},
-        {"symbol": "0700.HK", "quantity": 100.0, "average_price": 50.0},
+    assert [(p["symbol"], p["quantity"], p["average_price"]) for p in result] == [
+        ("NVDA", 5.0, 100.0),
+        ("0700.HK", 100.0, 50.0),
     ]
+    assert result[0]["pl_value"] is None  # P/L columns absent in this snapshot
     trade = fake_moomoo["created"][0]
     assert trade.pos_args["trd_env"] == "SIMULATE"
     assert trade.pos_args["acc_id"] == 123
+
+
+def test_get_positions_includes_pl_when_present(fake_moomoo):
+    fake_moomoo["pos_data"] = pd.DataFrame(
+        {
+            "code": ["US.NVDA"],
+            "qty": [5],
+            "cost_price": [100.0],
+            "nominal_price": [120.0],
+            "market_val": [600.0],
+            "pl_val": [100.0],
+            "pl_ratio": [20.0],
+        }
+    )
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    (pos,) = broker.get_positions()
+
+    assert pos["current_price"] == 120.0
+    assert pos["market_value"] == 600.0
+    assert pos["pl_value"] == 100.0
+    assert pos["pl_ratio"] == 20.0
 
 
 def test_get_positions_raises_on_query_error(fake_moomoo):
@@ -353,3 +398,121 @@ def test_get_positions_raises_on_query_error(fake_moomoo):
 
     with pytest.raises(RuntimeError, match="position query failed"):
         broker.get_positions()
+
+
+# ---- list_orders / cancel_order --------------------------------------------
+
+
+def _order_rows():
+    return pd.DataFrame(
+        {
+            "order_id": [1, 2],
+            "code": ["US.NVDA", "US.AAPL"],
+            "trd_side": ["BUY", "SELL"],
+            "qty": [2, 3],
+            "price": [200.0, 150.0],
+            "order_type": ["NORMAL", "NORMAL"],
+            "order_status": ["SUBMITTED", "FILLED_ALL"],
+        }
+    )
+
+
+def test_list_orders_returns_all_with_yahoo_symbols(fake_moomoo):
+    fake_moomoo["list_data"] = _order_rows()
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    orders = broker.list_orders()
+
+    assert [(o["order_id"], o["symbol"], o["side"], o["order_status"]) for o in orders] == [
+        (1, "NVDA", "BUY", "SUBMITTED"),
+        (2, "AAPL", "SELL", "FILLED_ALL"),
+    ]
+    assert orders[0]["price"] == 200.0
+    assert "code" not in fake_moomoo["created"][0].list_args  # account-wide query
+
+
+def test_list_orders_open_only_filters_terminal(fake_moomoo):
+    fake_moomoo["list_data"] = _order_rows()
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    orders = broker.list_orders(open_only=True)
+
+    assert [o["order_id"] for o in orders] == [1]  # FILLED_ALL dropped
+
+
+def test_list_orders_by_symbol_passes_code(fake_moomoo):
+    fake_moomoo["list_data"] = _order_rows()
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.list_orders("US.NVDA")
+
+    assert fake_moomoo["created"][0].list_args["code"] == "US.NVDA"
+
+
+def test_list_orders_raises_on_error(fake_moomoo):
+    fake_moomoo["list_ret"] = 1
+    fake_moomoo["list_data"] = "boom"
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    with pytest.raises(RuntimeError, match="order list failed"):
+        broker.list_orders()
+
+
+def test_cancel_order_cancels_by_id(fake_moomoo):
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.cancel_order(42)
+
+    trade = fake_moomoo["created"][0]
+    assert trade.modify_op == "CANCEL"
+    assert trade.modify_order_id == 42
+    assert trade.closed is True
+
+
+def test_cancel_order_raises_on_failure(fake_moomoo):
+    fake_moomoo["modify_ret"] = 1
+    fake_moomoo["modify_data"] = "no such order"
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    with pytest.raises(RuntimeError, match="cancel failed for order 42"):
+        broker.cancel_order(42)
+
+
+def test_status_name_resolves_numeric_enum():
+    moomoo = types.SimpleNamespace(
+        OrderStatus=types.SimpleNamespace(to_string=lambda v: "FILLED_ALL" if v == 11 else "?")
+    )
+
+    assert broker_mod._status_name(11, moomoo) == "FILLED_ALL"
+    assert broker_mod._status_name(" submitted ", moomoo) == "SUBMITTED"
+    assert broker_mod._status_name(None, moomoo) == ""
+
+
+def test_list_orders_canonicalizes_numeric_statuses(fake_moomoo, monkeypatch):
+    fake_moomoo["list_data"] = pd.DataFrame(
+        {
+            "order_id": [1],
+            "code": ["US.NVDA"],
+            "trd_side": ["BUY"],
+            "qty": [2],
+            "price": [200.0],
+            "order_type": ["NORMAL"],
+            "order_status": [11],  # numeric enum, not a name
+        }
+    )
+    # Teach the fake SDK to resolve the enum like the real one does.
+    ns_status = types.SimpleNamespace(to_string=lambda v: "FILLED_ALL" if v == 11 else "?")
+
+    real_moomoo = broker_mod._moomoo
+
+    def patched():
+        ns = real_moomoo()
+        ns.OrderStatus = ns_status
+        return ns
+
+    monkeypatch.setattr(broker_mod, "_moomoo", patched)
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    (order,) = broker.list_orders()
+
+    assert order["order_status"] == "FILLED_ALL"  # canonical name, not "11"

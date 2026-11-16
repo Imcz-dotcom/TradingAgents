@@ -14,6 +14,7 @@ a NORMAL (limit) order instead. Everything runs against an explicit ``trd_env``
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 
 from execution_agent.symbols import to_yahoo, trd_market
 
@@ -28,21 +29,38 @@ def _moomoo():
 # OrderStatus values that are still resting on the book (cancelable): a fresh
 # /auto run cancels these before placing its own orders. Filled/cancelled/failed
 # states are terminal and left alone.
-_OPEN_STATUSES = {"SUBMITTED", "SUBMITTING", "WAITING_SUBMIT", "FILLED_PART"}
+OPEN_STATUSES = {"SUBMITTED", "SUBMITTING", "WAITING_SUBMIT", "FILLED_PART"}
+
+
+def _opt_float(value) -> float | None:
+    """A float, or None when the broker omitted the column or sent junk/NaN."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(out) else out
+
+
+def _status_name(status, moomoo) -> str:
+    """A broker order-status value as its canonical name (e.g. ``SUBMITTED``).
+
+    Some SDK paths return the numeric enum instead of the name; resolving it
+    here means every consumer (open-only filters, the serve bot's fill watcher)
+    compares one canonical spelling. Unresolvable values come back as ``""``.
+    """
+    if status is None:
+        return ""
+    if isinstance(status, str):
+        return status.strip().upper()
+    try:
+        return str(moomoo.OrderStatus.to_string(int(status)))
+    except Exception:
+        return ""
 
 
 def _is_open_status(status, moomoo) -> bool:
     """Whether a broker order-status value is still resting (and thus cancelable)."""
-    if status is None:
-        return False
-    if isinstance(status, str):
-        return status.strip().upper() in _OPEN_STATUSES
-    # Some SDK paths return the numeric enum; resolve it back to a name.
-    try:
-        name = moomoo.OrderStatus.to_string(int(status))
-    except Exception:
-        return False
-    return name in _OPEN_STATUSES
+    return _status_name(status, moomoo) in OPEN_STATUSES
 
 
 def _is_protective_stop(order_type, moomoo) -> bool:
@@ -70,6 +88,25 @@ class MoomooBroker:
 
     def _trd_env(self, moomoo):
         return getattr(moomoo.TrdEnv, self.trading_env)
+
+    @contextmanager
+    def _trade_ctx(self):
+        """Open a trade context for one call, yielding ``(moomoo, ctx, trd_env)``.
+
+        Every trade method shares this connect/close ritual; keeping it in one
+        place means a cross-cutting change (timeout, retry, market filter)
+        lands once instead of in each method.
+        """
+        moomoo = _moomoo()
+        trd_ctx = moomoo.OpenSecTradeContext(
+            filter_trdmarket=moomoo.TrdMarket.NONE,
+            host=self.host,
+            port=self.port,
+        )
+        try:
+            yield moomoo, trd_ctx, self._trd_env(moomoo)
+        finally:
+            trd_ctx.close()
 
     def last_price(self, symbol: str) -> float:
         """The last traded price of ``symbol``, or a clear error when unavailable."""
@@ -111,14 +148,7 @@ class MoomooBroker:
         against the live quote. The account is looked up for ``trading_env`` so a
         SIMULATE run can never touch a REAL account id by accident.
         """
-        moomoo = _moomoo()
-        trd_ctx = moomoo.OpenSecTradeContext(
-            filter_trdmarket=moomoo.TrdMarket.NONE,
-            host=self.host,
-            port=self.port,
-        )
-        try:
-            trd_env = self._trd_env(moomoo)
+        with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
             acc_id = self._resolve_acc_id(trd_ctx, trd_env, moomoo, symbol)
             trd_side = moomoo.TrdSide.BUY if side == "BUY" else moomoo.TrdSide.SELL
 
@@ -150,8 +180,6 @@ class MoomooBroker:
                 "order_id": int(data["order_id"].iloc[0]),
                 "order_status": str(data["order_status"].iloc[0]),
             }
-        finally:
-            trd_ctx.close()
 
     def cancel_open_orders(self, symbol: str) -> int:
         """Cancel resting limit (target) orders on ``symbol``; return the count.
@@ -164,14 +192,7 @@ class MoomooBroker:
         filled/cancelled elsewhere) is skipped, not raised, so the caller always
         proceeds to today's order.
         """
-        moomoo = _moomoo()
-        trd_ctx = moomoo.OpenSecTradeContext(
-            filter_trdmarket=moomoo.TrdMarket.NONE,
-            host=self.host,
-            port=self.port,
-        )
-        try:
-            trd_env = self._trd_env(moomoo)
+        with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
             acc_id = self._resolve_acc_id(trd_ctx, trd_env, moomoo, symbol)
             ret, data = trd_ctx.order_list_query(
                 trd_env=trd_env, acc_id=acc_id, code=symbol
@@ -195,23 +216,15 @@ class MoomooBroker:
                 if c_ret == moomoo.RET_OK:
                     cancelled += 1
             return cancelled
-        finally:
-            trd_ctx.close()
 
     def get_account(self) -> dict:
-        """The account's cash and currency for the first ``trading_env`` account.
+        """The account's cash, currency and worth for the first ``trading_env`` account.
 
-        Returns ``{"cash": float, "currency": str}``. Uses the first account in
-        the list (not market-matched), since the whole book is being read here.
+        Returns ``{"cash", "currency", "total_assets", "market_value"}`` — the
+        last two are ``None`` when the broker omits them. Uses the first account
+        in the list (not market-matched), since the whole book is being read here.
         """
-        moomoo = _moomoo()
-        trd_ctx = moomoo.OpenSecTradeContext(
-            filter_trdmarket=moomoo.TrdMarket.NONE,
-            host=self.host,
-            port=self.port,
-        )
-        try:
-            trd_env = self._trd_env(moomoo)
+        with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
             acc_id = self._default_acc_id(trd_ctx, trd_env, moomoo)
             ret, data = trd_ctx.accinfo_query(trd_env=trd_env, acc_id=acc_id)
             if ret != moomoo.RET_OK:
@@ -220,25 +233,21 @@ class MoomooBroker:
             return {
                 "cash": float(row.get("cash")),
                 "currency": str(row.get("currency")),
+                "total_assets": _opt_float(row.get("total_assets")),
+                "market_value": _opt_float(row.get("market_val")),
             }
-        finally:
-            trd_ctx.close()
 
     def get_positions(self) -> list[dict]:
-        """Open positions as ``[{"symbol", "quantity", "average_price"}]``.
+        """Open positions with cost, worth and profit/loss.
 
-        Symbols come back as Moomoo codes (``US.NVDA``) and are translated to
-        Yahoo form via :func:`to_yahoo` so they match the watchlist and
-        ``PortfolioContext``. Rows with non-positive quantity are skipped.
+        Returns ``[{"symbol", "quantity", "average_price", "current_price",
+        "market_value", "pl_value", "pl_ratio"}]`` — the last four are ``None``
+        when the broker omits them. Symbols come back as Moomoo codes
+        (``US.NVDA``) and are translated to Yahoo form via :func:`to_yahoo` so
+        they match the watchlist and ``PortfolioContext``. Rows with
+        non-positive quantity are skipped.
         """
-        moomoo = _moomoo()
-        trd_ctx = moomoo.OpenSecTradeContext(
-            filter_trdmarket=moomoo.TrdMarket.NONE,
-            host=self.host,
-            port=self.port,
-        )
-        try:
-            trd_env = self._trd_env(moomoo)
+        with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
             acc_id = self._default_acc_id(trd_ctx, trd_env, moomoo)
             ret, data = trd_ctx.position_list_query(trd_env=trd_env, acc_id=acc_id)
             if ret != moomoo.RET_OK:
@@ -253,18 +262,73 @@ class MoomooBroker:
                         "symbol": to_yahoo(str(row["code"])),
                         "quantity": qty,
                         "average_price": float(row.get("cost_price") or 0.0),
+                        "current_price": _opt_float(row.get("nominal_price")),
+                        "market_value": _opt_float(row.get("market_val")),
+                        "pl_value": _opt_float(row.get("pl_val")),
+                        "pl_ratio": _opt_float(row.get("pl_ratio")),
                     }
                 )
             return positions
-        finally:
-            trd_ctx.close()
 
-    def _default_acc_id(self, trd_ctx, trd_env, moomoo) -> int:
-        """The first account id for ``trd_env``, regardless of market.
+    def list_orders(self, symbol: str | None = None, *, open_only: bool = False) -> list[dict]:
+        """Today's orders (optionally only the still-resting ones) for the account.
 
-        Shared by the account/position readers, which span markets rather than
-        targeting a single symbol.
+        Returns ``[{"order_id", "symbol" (Yahoo form), "side", "quantity",
+        "price", "order_type", "order_status"}]``. ``open_only=True`` keeps just
+        the orders still resting on the book (cancelable); the full list also
+        carries filled/cancelled orders, which the serve bot's fill-watcher
+        diffs against to notice "your order filled" transitions.
         """
+        with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
+            acc_id = self._default_acc_id(trd_ctx, trd_env, moomoo)
+            kwargs = {"trd_env": trd_env, "acc_id": acc_id}
+            if symbol is not None:
+                kwargs["code"] = symbol
+            ret, data = trd_ctx.order_list_query(**kwargs)
+            if ret != moomoo.RET_OK:
+                raise RuntimeError(f"order list failed: {data}")
+            orders: list[dict] = []
+            for _, row in data.iterrows():
+                # Canonical status name (numeric enums resolved), so consumers
+                # like the fill watcher compare one spelling.
+                status = _status_name(row.get("order_status"), moomoo)
+                if open_only and status not in OPEN_STATUSES:
+                    continue
+                try:
+                    order_id = int(row["order_id"])
+                except (TypeError, ValueError):
+                    continue
+                code = str(row.get("code") or "")
+                try:
+                    yahoo = to_yahoo(code)
+                except ValueError:
+                    yahoo = code
+                orders.append(
+                    {
+                        "order_id": order_id,
+                        "symbol": yahoo,
+                        "side": str(row.get("trd_side") or ""),
+                        "quantity": float(row.get("qty") or 0.0),
+                        "price": _opt_float(row.get("price")),
+                        "order_type": str(row.get("order_type") or ""),
+                        "order_status": status,
+                    }
+                )
+            return orders
+
+    def cancel_order(self, order_id: int) -> None:
+        """Cancel one resting order by id, raising a clear error on failure."""
+        with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
+            acc_id = self._default_acc_id(trd_ctx, trd_env, moomoo)
+            ret, data = trd_ctx.modify_order(
+                moomoo.ModifyOrderOp.CANCEL, int(order_id), 0, 0,
+                trd_env=trd_env, acc_id=acc_id,
+            )
+            if ret != moomoo.RET_OK:
+                raise RuntimeError(f"cancel failed for order {order_id}: {data}")
+
+    def _env_accounts(self, trd_ctx, trd_env, moomoo):
+        """The account rows for ``trd_env``, or a clear error when none exist."""
         ret, data = trd_ctx.get_acc_list()
         if ret != moomoo.RET_OK:
             raise RuntimeError(f"could not list accounts: {data}")
@@ -273,6 +337,15 @@ class MoomooBroker:
             raise RuntimeError(
                 f"no {self.trading_env} account found — is OpenD logged in with one?"
             )
+        return matching
+
+    def _default_acc_id(self, trd_ctx, trd_env, moomoo) -> int:
+        """The first account id for ``trd_env``, regardless of market.
+
+        Shared by the account/position readers, which span markets rather than
+        targeting a single symbol.
+        """
+        matching = self._env_accounts(trd_ctx, trd_env, moomoo)
         return int(matching.iloc[0]["acc_id"])
 
     def _resolve_acc_id(self, trd_ctx, trd_env, moomoo, symbol) -> int:
@@ -285,14 +358,7 @@ class MoomooBroker:
         error names every account and its markets instead of leaving the user to
         guess.
         """
-        ret, data = trd_ctx.get_acc_list()
-        if ret != moomoo.RET_OK:
-            raise RuntimeError(f"could not list accounts: {data}")
-        matching = data[data["trd_env"] == trd_env]
-        if matching.empty:
-            raise RuntimeError(
-                f"no {self.trading_env} account found — is OpenD logged in with one?"
-            )
+        matching = self._env_accounts(trd_ctx, trd_env, moomoo)
         market = trd_market(symbol)
         for _, row in matching.iterrows():
             if market in (row.get("trdmarket_auth") or []):

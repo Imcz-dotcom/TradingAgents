@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, fields
 
 from dotenv import load_dotenv
@@ -70,6 +71,15 @@ class ExecutionConfig:
     # /auto: an "Underweight" sell trims to this fraction of the position (a
     # "Sell" is always a full exit). Lets /auto reduce without dumping it all.
     auto_underweight_trim: float = 0.50
+    # Run /auto by itself every day at this local time ("HH:MM", e.g. "09:00").
+    # Empty = no schedule. The scheduled run is quiet: it reports only the final
+    # plan, orders placed, and errors — no per-phase research chatter.
+    auto_schedule: str = ""
+    # Budget (dollars of new money) for the *scheduled* run; 0 = manage-only.
+    auto_schedule_budget: float = 0.0
+    # /chat: how many past Q&A turns are replayed into the prompt. Caps token
+    # cost — the research transcript dominates anyway, and old turns go stale.
+    chat_history_turns: int = 8
 
     def __post_init__(self) -> None:
         self.validate()
@@ -88,6 +98,16 @@ class ExecutionConfig:
         if not 0 < self.auto_underweight_trim <= 1:
             raise ValueError(
                 f"auto_underweight_trim must be in (0, 1], got {self.auto_underweight_trim!r}"
+            )
+        if self.auto_schedule:
+            self.parsed_auto_schedule()  # raises on an unreadable time
+        if self.auto_schedule_budget < 0:
+            raise ValueError(
+                f"auto_schedule_budget must be >= 0, got {self.auto_schedule_budget!r}"
+            )
+        if self.chat_history_turns <= 0:
+            raise ValueError(
+                f"chat_history_turns must be positive, got {self.chat_history_turns!r}"
             )
         if self.side_mapping is not None:
             self.parsed_side_mapping()  # raises on invalid JSON / shape
@@ -108,6 +128,17 @@ class ExecutionConfig:
                 seen.add(ticker)
                 out.append(ticker)
         return out
+
+    def parsed_auto_schedule(self) -> tuple[int, int] | None:
+        """The daily /auto schedule as ``(hour, minute)``, or None when unset."""
+        if not self.auto_schedule:
+            return None
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", self.auto_schedule.strip())
+        if m is None or int(m[1]) > 23 or int(m[2]) > 59:
+            raise ValueError(
+                f"auto_schedule must be HH:MM (e.g. 09:00), got {self.auto_schedule!r}"
+            )
+        return int(m[1]), int(m[2])
 
     def parsed_side_mapping(self) -> dict[str, str] | None:
         """The rating -> side override as a dict, or None when unset."""

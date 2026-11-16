@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from execution_agent import auto, persist
+from execution_agent import auto, persist, watchlist
 from execution_agent.config import ExecutionConfig
 from execution_agent.decision import DecisionResult
 from tradingagents.portfolio import PortfolioContext, Position
@@ -221,6 +221,8 @@ def patched(monkeypatch, tmp_path):
     # Isolate the same-day reuse cache: an empty history means "nothing reused",
     # so these tests exercise fresh research (the reuse path has its own test).
     monkeypatch.setattr(persist, "history_path", lambda: str(tmp_path / "history.json"))
+    # Isolate the live watchlist file: absent -> the config seed is used.
+    monkeypatch.setattr(watchlist, "watchlist_path", lambda: str(tmp_path / "wl.json"))
     calls: list[str] = []
 
     def _apply(broker, decisions, prices):
@@ -329,6 +331,66 @@ def test_run_auto_re_researches_plan_ticker_missing_from_store(patched):
     assert calls == ["AAPL"]
     plan = auto.auto_plan.load_plan()
     assert [e["ticker"] for e in plan["plan"]] == ["NVDA", "AAPL"]
+
+
+def test_run_auto_skips_ticker_that_errored_today(patched):
+    """A ticker that failed earlier today isn't re-researched on a same-day run."""
+    broker = _FakeBroker(last=200.0)
+    apply, calls = patched
+    apply(broker, {}, _prices())
+
+    auto.auto_plan.save_plan(
+        {"date": date.today().isoformat(), "cash": 5000.0, "currency": "USD",
+         "positions": [], "universe": ["APPL"],
+         "plan": [{"ticker": "APPL", "side": None, "reason": "error", "signal": "unknown ticker"}]}
+    )
+
+    result = auto.run_auto(ExecutionConfig(watchlist="APPL"))
+
+    assert calls == []  # the failing ticker is not retried today
+    assert "nothing new to research" in result
+
+
+def test_run_auto_uses_live_watchlist_file(patched, tmp_path):
+    """/watchlist edits (the stored file) win over the .env seed."""
+    broker = _FakeBroker(last=200.0)
+    decisions = {"AMD": _decision(yahoo="AMD", signal="Buy", side="BUY")}
+    apply, calls = patched
+    apply(broker, decisions, _prices(entry=200.0))
+    watchlist.save(["AMD"])  # the phone-edited list replaces the seed
+
+    auto.run_auto(ExecutionConfig(watchlist="NVDA"), budget=400.0)
+
+    assert calls == ["AMD"]  # file list, not the NVDA seed
+
+
+def test_run_auto_progress_is_per_ticker_not_per_phase(patched):
+    broker = _FakeBroker(last=200.0)
+    decisions = {"NVDA": _decision(yahoo="NVDA", signal="Buy", side="BUY")}
+    apply, _ = patched
+    apply(broker, decisions, _prices(entry=200.0))
+    steps: list[str] = []
+
+    auto.run_auto(ExecutionConfig(watchlist="NVDA"), budget=400.0, on_step=steps.append)
+
+    assert any("researching NVDA" in s for s in steps)
+    assert any(s.startswith("✅ Auto: BUY NVDA") for s in steps)
+
+
+def test_run_auto_quiet_sends_only_serious(patched):
+    """quiet=True (the scheduled run): orders yes, routine progress no."""
+    broker = _FakeBroker(last=200.0)
+    decisions = {"NVDA": _decision(yahoo="NVDA", signal="Buy", side="BUY")}
+    apply, _ = patched
+    apply(broker, decisions, _prices(entry=200.0))
+    steps: list[str] = []
+
+    auto.run_auto(
+        ExecutionConfig(watchlist="NVDA"), budget=400.0, on_step=steps.append, quiet=True
+    )
+
+    assert not any("researching" in s for s in steps)  # routine chatter dropped
+    assert any(s.startswith("✅ Auto: BUY NVDA") for s in steps)  # orders still land
 
 
 def test_run_auto_researches_stale_plan(patched, tmp_path):

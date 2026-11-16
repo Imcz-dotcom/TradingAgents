@@ -24,8 +24,10 @@ from execution_agent.notify import (
     SHARES,
     SKIP,
     STOP,
+    TELEGRAM_MAX_CHARS,
     USD,
     TelegramNotifier,
+    fit_telegram as _fit_telegram,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -41,18 +43,8 @@ app = typer.Typer(
 )
 
 
-# Telegram rejects a single message over 4096 characters, so a summary longer
-# than that can't go in one shot. Send the analyst's full reasoning and truncate
-# only at Telegram's own ceiling — never at a short "preview" length that would
-# hide most of the decision.
-TELEGRAM_MAX_CHARS = 4096
-
-
-def _fit_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> str:
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+# TELEGRAM_MAX_CHARS and _fit_telegram live in notify.py (send() enforces the
+# cap itself); they are re-imported above so existing callers keep working.
 
 
 def _print_decision(decision) -> None:

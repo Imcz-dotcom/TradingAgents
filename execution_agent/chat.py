@@ -107,9 +107,11 @@ def _compact_decision(final_state: dict) -> str:
     return decision if len(decision) <= 400 else decision[:400].rstrip() + "…"
 
 
-def build_prompt(researches: dict, ticker: str, history: list[dict], question: str) -> str:
+def build_prompt(
+    researches: dict, ticker: str, history: list[dict], question: str, *, max_turns: int = 8
+) -> str:
     """One chat turn's prompt: the target's full research, a digest of the rest,
-    the Q&A so far, then the question.
+    the recent Q&A, then the question.
 
     ``researches`` maps each ticker researched today to its final state. The
     target ``ticker`` gets the full transcript; every other ticker gets a compact
@@ -117,8 +119,11 @@ def build_prompt(researches: dict, ticker: str, history: list[dict], question: s
     answered without the whole day's transcripts.
 
     ``history`` is the day's whole conversation (not just this ticker's), as
-    ``{"ticker", "q", "a"}`` entries. A turn about a different ticker is labelled
-    so the assistant can tell which research a past answer drew on.
+    ``{"ticker", "q", "a"}`` entries. Only the last ``max_turns`` are replayed —
+    each turn re-sends the whole prompt, so an unbounded history would make every
+    question costlier than the last for stale context. A turn about a different
+    ticker is labelled so the assistant can tell which research a past answer
+    drew on.
     """
     target = researches.get(ticker) or {} if isinstance(researches, dict) else {}
     transcript = research_transcript(target)
@@ -138,7 +143,7 @@ def build_prompt(researches: dict, ticker: str, history: list[dict], question: s
     history_block = ""
     if history:
         lines = []
-        for entry in history:
+        for entry in history[-max_turns:]:
             q, a = entry.get("q"), entry.get("a")
             if entry.get("ticker") and entry.get("ticker") != ticker:
                 lines.append(f"Q (about {entry['ticker']}): {q}\nA: {a}")
@@ -159,7 +164,10 @@ def build_prompt(researches: dict, ticker: str, history: list[dict], question: s
     )
 
 
-def answer(researches: dict, ticker: str, history: list[dict], question: str) -> str:
+def answer(
+    researches: dict, ticker: str, history: list[dict], question: str, *, max_turns: int = 8
+) -> str:
     """Answer one question about the research, returning the model's reply."""
-    result = _deep_llm().invoke(build_prompt(researches, ticker, history, question)).content
+    prompt = build_prompt(researches, ticker, history, question, max_turns=max_turns)
+    result = _deep_llm().invoke(prompt).content
     return result if isinstance(result, str) else str(result)

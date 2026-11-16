@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
+import re
 import threading
 import time
 
@@ -34,6 +36,36 @@ STOP = "stop"
 # Words that abort whatever the bot is waiting on. A leading "/" is stripped so
 # Telegram slash commands ("/stop", "/cancel") work too.
 STOP_WORDS = ("stop", "cancel", "abort", "quit")
+
+# Telegram rejects a single message over 4096 characters. ``send`` enforces the
+# cap itself, so no caller can crash the bot with a long /status report or
+# /auto summary; callers that want to budget the space (header + body + footer)
+# still call ``fit_telegram`` with their own limit first.
+TELEGRAM_MAX_CHARS = 4096
+
+
+def fit_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> str:
+    """``text`` trimmed to ``limit`` characters, ellipsised when it was longer."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+# The bot's messages (and the LLM's summaries) are written in Markdown-ish text:
+# **bold** section labels and `code` spans. Telegram renders neither by default,
+# so they used to show as literal asterisks/backticks on the phone. We convert
+# just those two forms to Telegram HTML (its most forgiving parse mode) and
+# escape everything else, falling back to plain text if Telegram still objects.
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_CODE_RE = re.compile(r"`([^`\n]+)`")
+
+
+def to_telegram_html(text: str) -> str:
+    """Escape ``text`` for Telegram HTML, rendering **bold** and `code` spans."""
+    escaped = html.escape(str(text), quote=False)
+    escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
+    return _CODE_RE.sub(r"<code>\1</code>", escaped)
 
 
 def is_stop(text: str) -> bool:
@@ -68,8 +100,15 @@ class TelegramNotifier:
             self._bot = Bot(self.token)
         return self._bot
 
-    async def send(self, text: str, buttons: list[tuple[str, str]] | None = None) -> None:
-        """Send a message, optionally with a row of inline buttons.
+    async def send(self, text: str, buttons=None) -> None:
+        """Send a message, optionally with inline buttons.
+
+        ``buttons`` is a list of ``(label, callback_data)`` pairs (one row), or
+        a list of such lists (one row each). The text is always fitted to
+        Telegram's 4096-character cap here, so a long report can never raise
+        out of a handler. The HTML-formatted variant is used when it still fits
+        the cap (escaping can grow the text); otherwise — or when Telegram
+        rejects the markup — the plain text is sent instead.
 
         Retries only on a *connection* failure, where nothing was sent. A read
         timeout means Telegram may already have the message (only the ack was
@@ -79,19 +118,45 @@ class TelegramNotifier:
         if buttons:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+            rows = buttons if isinstance(buttons[0], list) else [buttons]
             reply_markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(label, callback_data=data) for label, data in buttons]]
+                [
+                    [InlineKeyboardButton(label, callback_data=data) for label, data in row]
+                    for row in rows
+                ]
             )
-        from telegram.error import NetworkError, TimedOut
+        from telegram.error import BadRequest, NetworkError, TimedOut
+
+        text = fit_telegram(text)
+        html_text = to_telegram_html(text)
+        use_html = len(html_text) <= TELEGRAM_MAX_CHARS
 
         last_exc = None
         for attempt in range(3):
             try:
                 # A slightly longer read timeout helps a slow/high-latency link
                 # (e.g. Telegram over a flaky connection) without stalling.
-                await self.bot.send_message(
-                    self.chat_id, text, reply_markup=reply_markup, read_timeout=15
-                )
+                try:
+                    if use_html:
+                        await self.bot.send_message(
+                            self.chat_id,
+                            html_text,
+                            reply_markup=reply_markup,
+                            read_timeout=15,
+                            parse_mode="HTML",
+                        )
+                    else:
+                        await self.bot.send_message(
+                            self.chat_id, text, reply_markup=reply_markup, read_timeout=15
+                        )
+                except BadRequest:
+                    if not use_html:
+                        raise  # plain text refused — nothing simpler to fall back to
+                    # Telegram rejected the HTML (odd markup in an LLM summary):
+                    # the message matters more than the formatting — send plain.
+                    await self.bot.send_message(
+                        self.chat_id, text, reply_markup=reply_markup, read_timeout=15
+                    )
                 return
             except TimedOut:
                 # The request may already have reached Telegram (a read timeout
@@ -156,6 +221,10 @@ class TelegramNotifier:
         Used by the persistent ``serve`` loop as its idle wait: it long-polls
         Telegram (30s) until a message arrives, so nothing is consumed on a
         timer. Returns ``None`` only if polling is interrupted.
+
+        A tapped inline button whose callback data looks like a command
+        (``/execute NVDA``) is returned exactly as if the user had typed it, so
+        the serve loop's buttons dispatch through the same parser as text.
         """
         from telegram.error import NetworkError
 
@@ -164,7 +233,7 @@ class TelegramNotifier:
                 updates = await self.bot.get_updates(
                     offset=self._offset,
                     timeout=30,
-                    allowed_updates=["message"],
+                    allowed_updates=["message", "callback_query"],
                 )
             except NetworkError:  # transient: wait a moment and poll again
                 await asyncio.sleep(2)
@@ -174,6 +243,16 @@ class TelegramNotifier:
                 msg = getattr(update, "message", None)
                 if msg is not None and msg.chat_id == self.chat_id and msg.text:
                     return msg.text.strip()
+                query = getattr(update, "callback_query", None)
+                if (
+                    query is not None
+                    and query.message is not None
+                    and query.message.chat_id == self.chat_id
+                    and isinstance(query.data, str)
+                    and query.data.startswith("/")
+                ):
+                    await self._answer(query)
+                    return query.data
 
     async def _answer(self, query) -> None:
         """Acknowledge a callback so the button's spinner stops for the user."""

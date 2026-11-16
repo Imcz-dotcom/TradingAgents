@@ -63,3 +63,12 @@ def test_build_prompt_includes_other_tickers_digest():
     # The other ticker's long thesis is dropped from the digest; the target's is kept.
     assert "apple thesis" not in prompt
     assert "nvidia thesis" in prompt
+
+
+def test_build_prompt_caps_history_turns():
+    history = [{"ticker": "NVDA", "q": f"q{i}", "a": f"a{i}"} for i in range(20)]
+
+    prompt = chat.build_prompt({"NVDA": {}}, "NVDA", history, "next?", max_turns=3)
+
+    assert "q19" in prompt and "q17" in prompt  # the newest three survive
+    assert "q16" not in prompt and "q0" not in prompt  # older turns dropped

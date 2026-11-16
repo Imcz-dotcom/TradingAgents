@@ -145,3 +145,27 @@ def test_side_mapping_rejects_non_string_values():
 def test_mode_label_paper_and_real():
     assert "PAPER" in mode_label("SIMULATE")
     assert "REAL" in mode_label("REAL")
+
+
+def test_auto_schedule_parses_time():
+    assert ExecutionConfig(auto_schedule="09:30").parsed_auto_schedule() == (9, 30)
+
+
+def test_auto_schedule_none_when_unset():
+    assert ExecutionConfig().parsed_auto_schedule() is None
+
+
+@pytest.mark.parametrize("value", ["9am", "25:00", "09:61", "09", "09:00:00"])
+def test_auto_schedule_rejects_bad_time(value):
+    with pytest.raises(ValueError):
+        ExecutionConfig(auto_schedule=value)
+
+
+def test_auto_schedule_budget_rejects_negative():
+    with pytest.raises(ValueError):
+        ExecutionConfig(auto_schedule_budget=-1.0)
+
+
+def test_chat_history_turns_rejects_non_positive():
+    with pytest.raises(ValueError):
+        ExecutionConfig(chat_history_turns=0)

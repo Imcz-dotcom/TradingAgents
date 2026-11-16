@@ -86,19 +86,6 @@ def test_parse_execute_command_not_execute(text):
     assert serve_mod.parse_execute_command(text) == (False, None)
 
 
-@pytest.mark.parametrize(
-    "text",
-    ["/auto", "/AUTO", "/auto now", "  /auto  "],
-)
-def test_is_auto_command_true(text):
-    assert serve_mod.is_auto_command(text) is True
-
-
-@pytest.mark.parametrize("text", ["auto", "NVDA", "/execute", "/autopilot", "", None])
-def test_is_auto_command_false(text):
-    assert serve_mod.is_auto_command(text) is False
-
-
 # ---- parse_auto_command ----------------------------------------------------
 
 
@@ -454,7 +441,7 @@ def test_serve_loop_auto_dispatches(monkeypatch, tmp_path):
     """/auto runs the autonomous loop with the current (paper) mode + budget."""
     calls = []
 
-    def fake_run_auto(config, *, budget=None, trading_env=None, audit=None, on_step=None, stop_check=None):
+    def fake_run_auto(config, *, budget=None, trading_env=None, audit=None, on_step=None, stop_check=None, quiet=False):
         calls.append((budget, trading_env))
         return "📊 Auto done"
 
@@ -529,7 +516,7 @@ def test_serve_loop_restores_all_tickers_and_chat_from_today(monkeypatch, tmp_pa
 
     answers = []
 
-    def fake_answer(final_state, ticker, history, question):
+    def fake_answer(final_state, ticker, history, question, max_turns=8):
         answers.append((ticker, list(history), question))
         return "got it"
 
@@ -781,7 +768,7 @@ def test_serve_loop_chat_targets_named_ticker(monkeypatch, tmp_path):
     """``/chat NVDA ...`` answers from NVDA even after INTC is the latest."""
     targets = []
 
-    def fake_answer(final_state, ticker, history, question):
+    def fake_answer(final_state, ticker, history, question, max_turns=8):
         targets.append(ticker)
         return f"answered for {ticker}"
 
@@ -807,7 +794,7 @@ def test_serve_loop_drops_raw_messages_from_in_memory_research(monkeypatch, tmp_
     """The raw agent ``messages`` are dead weight in RAM; /chat sees only the subset."""
     seen = []
 
-    def fake_answer(final_state, ticker, history, question):
+    def fake_answer(final_state, ticker, history, question, max_turns=8):
         seen.append(final_state)
         return "ok"
 
@@ -847,3 +834,285 @@ def test_serve_loop_drops_raw_messages_from_in_memory_research(monkeypatch, tmp_
     nvda = seen[0].get("NVDA") or {}
     assert "messages" not in nvda
     assert "market_report" in nvda
+
+
+# ---- new assistant commands: parsing ----------------------------------------
+
+
+@pytest.mark.parametrize("text", ["/help", "/HELP", "/commands", "  /help  "])
+def test_is_help_command_true(text):
+    assert serve_mod.is_help_command(text) is True
+
+
+@pytest.mark.parametrize("text", ["help", "NVDA", "/chat help", "", None])
+def test_is_help_command_false(text):
+    assert serve_mod.is_help_command(text) is False
+
+
+@pytest.mark.parametrize("text", ["/status", "/portfolio", "/report", "/STATUS"])
+def test_is_status_command_true(text):
+    assert serve_mod.is_status_command(text) is True
+
+
+@pytest.mark.parametrize("text", ["status", "NVDA", "/stat", "", None])
+def test_is_status_command_false(text):
+    assert serve_mod.is_status_command(text) is False
+
+
+def test_is_orders_command():
+    assert serve_mod.is_orders_command("/orders") is True
+    assert serve_mod.is_orders_command("/order NVDA") is False  # research alias
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/cancel 123", 123),
+        ("/cancelorder 42", 42),
+        ("/CANCEL 7", 7),
+        ("/cancel", None),  # bare /cancel is a stop word, not an order cancel
+        ("/cancel abc", None),
+        ("NVDA", None),
+        (None, None),
+    ],
+)
+def test_parse_cancel_order(text, expected):
+    assert serve_mod.parse_cancel_order(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/watchlist", (True, None, None)),
+        ("/watchlist add AMD", (True, "add", "AMD")),
+        ("/watchlist AMD", (True, "add", "AMD")),  # bare ticker means add
+        ("/watchlist remove amd", (True, "remove", "AMD")),
+        ("/watchlist rm AMD", (True, "remove", "AMD")),
+        ("/watchlist del AMD", (True, "remove", "AMD")),
+        ("NVDA", (False, None, None)),
+        (None, (False, None, None)),
+    ],
+)
+def test_parse_watchlist_command(text, expected):
+    assert serve_mod.parse_watchlist_command(text) == expected
+
+
+# ---- fill watcher + schedule (pure helpers) ---------------------------------
+
+
+def _order(oid, status, side="BUY", qty=2.0, symbol="NVDA", price=200.0):
+    return {
+        "order_id": oid, "symbol": symbol, "side": side, "quantity": qty,
+        "price": price, "order_type": "NORMAL", "order_status": status,
+    }
+
+
+def test_fill_messages_notifies_on_open_to_filled():
+    prev = {1: "SUBMITTED"}
+
+    messages, current = serve_mod._fill_messages(prev, [_order(1, "FILLED_ALL")])
+
+    assert messages == ["🎉 Order filled: BUY 2 NVDA @ 200"]
+    assert current == {1: "FILLED_ALL"}
+
+
+def test_fill_messages_silent_without_transition():
+    # Unknown order already filled (first sight) and an order still open: quiet.
+    messages, current = serve_mod._fill_messages(
+        {2: "SUBMITTED"}, [_order(1, "FILLED_ALL"), _order(2, "SUBMITTED")]
+    )
+
+    assert messages == []
+    assert current == {1: "FILLED_ALL", 2: "SUBMITTED"}
+
+
+def test_fill_messages_cancelled_is_not_a_fill():
+    messages, _ = serve_mod._fill_messages({1: "SUBMITTED"}, [_order(1, "CANCELLED_ALL")])
+
+    assert messages == []
+
+
+def test_schedule_due_fires_once_after_time():
+    from datetime import datetime
+
+    now = datetime(2026, 11, 15, 9, 30)
+
+    assert serve_mod._schedule_due((9, 0), now, None, None) is True
+    # Already ran today (either via the scheduler or a manual /auto plan).
+    assert serve_mod._schedule_due((9, 0), now, "2026-11-15", None) is False
+    assert serve_mod._schedule_due((9, 0), now, None, "2026-11-15") is False
+    # Before the scheduled time, or no schedule at all.
+    assert serve_mod._schedule_due((10, 0), now, None, None) is False
+    assert serve_mod._schedule_due(None, now, None, None) is False
+
+
+# ---- format_status ----------------------------------------------------------
+
+
+def test_format_status_renders_positions_and_pl():
+    text = serve_mod.format_status(
+        "SIMULATE",
+        {"cash": 10000.0, "currency": "USD", "total_assets": 11000.0, "market_value": 1000.0},
+        [{
+            "symbol": "NVDA", "quantity": 5.0, "average_price": 100.0,
+            "current_price": 120.0, "market_value": 600.0, "pl_value": 100.0,
+            "pl_ratio": 20.0,
+        }],
+        [_order(1, "SUBMITTED")],
+        ["NVDA", "INTC"],
+        ["NVDA", "AMD"],
+    )
+
+    assert "Cash: 10,000.00 USD" in text
+    assert "Total assets: 11,000.00 USD" in text
+    assert "NVDA ×5 @ 100 → 120 🟢 +100.00 (+20.0%)" in text
+    assert "Open orders: 1" in text
+    assert "Researched today: NVDA, INTC" in text
+    assert "Watchlist: NVDA, AMD" in text
+
+
+def test_format_status_minimal_account():
+    text = serve_mod.format_status(
+        "SIMULATE",
+        {"cash": 500.0, "currency": None, "total_assets": None, "market_value": None},
+        [], [], [], [],
+    )
+
+    assert "Cash: 500.00" in text
+    assert "Positions: none" in text
+    assert "Total assets" not in text
+
+
+# ---- serve loop: /help, /status, /watchlist ---------------------------------
+
+
+def test_serve_loop_help_lists_commands(monkeypatch, tmp_path):
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class HelpNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/help",))
+
+    _wire(monkeypatch, tmp_path, HelpNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    sent = HelpNotifier.instances[0].sent
+    assert any("/watchlist" in s and "/status" in s for s in sent)
+
+
+def test_serve_loop_status_reports_account(monkeypatch, tmp_path):
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class FakeBroker:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_account(self):
+            return {"cash": 9000.0, "currency": "USD", "total_assets": None, "market_value": None}
+
+        def get_positions(self):
+            return []
+
+        def list_orders(self, symbol=None, open_only=False):
+            return []
+
+    monkeypatch.setattr(serve_mod, "MoomooBroker", FakeBroker)
+    monkeypatch.setattr(serve_mod.watchlist, "watchlist_path", lambda: str(tmp_path / "wl.json"))
+
+    class StatusNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/status",))
+
+    _wire(monkeypatch, tmp_path, StatusNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    sent = StatusNotifier.instances[0].sent
+    assert any("Cash: 9,000.00 USD" in s for s in sent)
+
+
+def test_serve_loop_status_degrades_without_broker(monkeypatch, tmp_path):
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class DeadBroker:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_account(self):
+            raise RuntimeError("OpenD is not running")
+
+    monkeypatch.setattr(serve_mod, "MoomooBroker", DeadBroker)
+
+    class StatusNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/status",))
+
+    _wire(monkeypatch, tmp_path, StatusNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    sent = StatusNotifier.instances[0].sent
+    assert any("Couldn't read the account" in s for s in sent)
+
+
+def test_serve_loop_watchlist_add_and_show(monkeypatch, tmp_path):
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+    monkeypatch.setattr(serve_mod.watchlist, "watchlist_path", lambda: str(tmp_path / "wl.json"))
+
+    class WlNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/watchlist add AMD", "/watchlist"))
+
+    _wire(monkeypatch, tmp_path, WlNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    sent = WlNotifier.instances[0].sent
+    assert any("Added AMD" in s for s in sent)
+    assert any(s.startswith("👀 Watchlist: AMD") for s in sent)
+
+
+def test_serve_loop_watchlist_rejects_bad_symbol(monkeypatch, tmp_path):
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+    monkeypatch.setattr(serve_mod.watchlist, "watchlist_path", lambda: str(tmp_path / "wl.json"))
+
+    class WlNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/watchlist add BTC-USD",))
+
+    _wire(monkeypatch, tmp_path, WlNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    sent = WlNotifier.instances[0].sent
+    assert any("Can't watch BTC-USD" in s for s in sent)
+
+
+def test_serve_loop_research_summary_has_buttons(monkeypatch, tmp_path):
+    """The research summary carries tap-able Execute/Ask buttons."""
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class ButtonNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("NVDA",))
+            self.buttoned = []
+
+        async def send(self, text, buttons=None):
+            self.sent.append(text)
+            if buttons:
+                self.buttoned.append(buttons)
+
+    _wire(monkeypatch, tmp_path, ButtonNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    flat = [b for row in ButtonNotifier.instances[0].buttoned for b in row]
+    assert ("▶️ Execute NVDA", "/execute NVDA") in flat
+    assert ("💬 Ask about it", "/chat NVDA") in flat

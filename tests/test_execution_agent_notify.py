@@ -17,6 +17,7 @@ from execution_agent.notify import (
     USD,
     TelegramNotifier,
     is_stop,
+    to_telegram_html,
 )
 
 
@@ -47,11 +48,15 @@ class FakeBot:
         self.polls = list(polls)
         self.sent = []
         self.answered = []
+        self.allowed = []  # allowed_updates per get_updates call
 
-    async def send_message(self, chat_id, text, reply_markup=None, read_timeout=None):
+    async def send_message(
+        self, chat_id, text, reply_markup=None, read_timeout=None, parse_mode=None
+    ):
         self.sent.append((chat_id, text, reply_markup))
 
     async def get_updates(self, offset=None, timeout=0, allowed_updates=None):
+        self.allowed.append(allowed_updates)
         return self.polls.pop(0) if self.polls else []
 
     async def answer_callback_query(self, callback_query_id):
@@ -73,7 +78,9 @@ def test_send_does_not_duplicate_on_timeout():
         def __init__(self):
             self.calls = 0
 
-        async def send_message(self, chat_id, text, reply_markup=None, read_timeout=None):
+        async def send_message(
+            self, chat_id, text, reply_markup=None, read_timeout=None, parse_mode=None
+        ):
             self.calls += 1
             raise TimedOut("Timed out")
 
@@ -100,7 +107,9 @@ def test_send_retries_on_connection_failure():
         def __init__(self):
             self.calls = 0
 
-        async def send_message(self, chat_id, text, reply_markup=None, read_timeout=None):
+        async def send_message(
+            self, chat_id, text, reply_markup=None, read_timeout=None, parse_mode=None
+        ):
             self.calls += 1
             if self.calls < 3:
                 raise NetworkError("boom")
@@ -109,6 +118,94 @@ def test_send_retries_on_connection_failure():
     bot = FlakyBot()
     _run(TelegramNotifier("tok", 111, bot=bot).send("hi"))
     assert bot.calls == 3  # retried the connection failure
+
+
+# ---- HTML formatting -------------------------------------------------------
+
+
+def test_to_telegram_html_renders_bold_and_code():
+    assert (
+        to_telegram_html("**Rating**: Buy — try `/execute`")
+        == "<b>Rating</b>: Buy — try <code>/execute</code>"
+    )
+
+
+def test_to_telegram_html_escapes_html():
+    assert to_telegram_html("a < b & c > d") == "a &lt; b &amp; c &gt; d"
+
+
+def test_to_telegram_html_plain_text_unchanged():
+    assert to_telegram_html("just words") == "just words"
+
+
+def test_send_formats_as_html():
+    class RecordingBot(FakeBot):
+        def __init__(self):
+            super().__init__(polls=[])
+            self.parse_modes = []
+
+        async def send_message(
+            self, chat_id, text, reply_markup=None, read_timeout=None, parse_mode=None
+        ):
+            self.parse_modes.append(parse_mode)
+            self.sent.append((chat_id, text, reply_markup))
+
+    bot = RecordingBot()
+    _run(TelegramNotifier("tok", 111, bot=bot).send("**bold** and `code`"))
+
+    assert bot.parse_modes == ["HTML"]
+    assert bot.sent[0][1] == "<b>bold</b> and <code>code</code>"
+
+
+def test_send_falls_back_to_plain_on_bad_html():
+    """Telegram rejecting the HTML must not lose the message — resend plain."""
+    from telegram.error import BadRequest
+
+    class PickyBot(FakeBot):
+        def __init__(self):
+            super().__init__(polls=[])
+            self.calls = []
+
+        async def send_message(
+            self, chat_id, text, reply_markup=None, read_timeout=None, parse_mode=None
+        ):
+            self.calls.append((text, parse_mode))
+            if parse_mode == "HTML":
+                raise BadRequest("can't parse entities")
+
+    bot = PickyBot()
+    _run(TelegramNotifier("tok", 111, bot=bot).send("**odd** markup"))
+
+    assert bot.calls[0][1] == "HTML"
+    assert bot.calls[1] == ("**odd** markup", None)  # original text, plain
+
+
+# ---- wait_for_ticker button taps -------------------------------------------
+
+
+def test_wait_for_ticker_returns_command_from_button_tap():
+    """A tapped button whose data is a command acts exactly like typing it."""
+    bot = FakeBot(
+        polls=[[FakeUpdate(1, callback_query=FakeCallbackQuery("cq1", 111, "/execute NVDA"))]]
+    )
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+
+    assert _run(notifier.wait_for_ticker()) == "/execute NVDA"
+    assert bot.answered == ["cq1"]  # spinner stopped
+    assert "callback_query" in bot.allowed[0]
+
+
+def test_wait_for_ticker_ignores_non_command_callback():
+    bot = FakeBot(
+        polls=[
+            [FakeUpdate(1, callback_query=FakeCallbackQuery("cq1", 111, "approve"))],
+            [FakeUpdate(2, message=FakeMessage(111, "NVDA"))],
+        ]
+    )
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+
+    # The stray non-command callback (stale button) is skipped, not returned.
+    assert _run(notifier.wait_for_ticker()) == "NVDA"
 
 
 # ---- ask_text --------------------------------------------------------------
@@ -243,3 +340,47 @@ def test_drain_pending_drops_non_stop_messages():
 
     assert _run(notifier._drain_pending()) is None
     assert notifier._offset == 2
+
+
+def test_send_fits_overlong_text_to_telegram_cap():
+    """send() enforces the 4096 cap itself — no caller can crash the bot."""
+    bot = FakeBot(polls=[])
+    _run(TelegramNotifier("tok", 111, bot=bot).send("x" * 10_000))
+
+    assert len(bot.sent[0][1]) <= 4096
+
+
+def test_send_uses_plain_when_escaping_overflows_cap():
+    """HTML escaping can grow text past 4096 — then the plain text is sent."""
+
+    class RecordingBot(FakeBot):
+        def __init__(self):
+            super().__init__(polls=[])
+            self.parse_modes = []
+
+        async def send_message(
+            self, chat_id, text, reply_markup=None, read_timeout=None, parse_mode=None
+        ):
+            self.parse_modes.append(parse_mode)
+            self.sent.append((chat_id, text, reply_markup))
+
+    bot = RecordingBot()
+    _run(TelegramNotifier("tok", 111, bot=bot).send("&" * 4000))
+
+    assert bot.parse_modes == [None]  # plain — the escaped form would be 5x the cap
+    assert bot.sent[0][1] == "&" * 4000
+
+
+def test_send_renders_multi_row_buttons():
+    bot = FakeBot(polls=[])
+    _run(
+        TelegramNotifier("tok", 111, bot=bot).send(
+            "orders", buttons=[[("❌ #1", "/cancel 1")], [("❌ #2", "/cancel 2")]]
+        )
+    )
+
+    markup = bot.sent[0][2]
+    assert [[(b.text, b.callback_data) for b in row] for row in markup.inline_keyboard] == [
+        [("❌ #1", "/cancel 1")],
+        [("❌ #2", "/cancel 2")],
+    ]

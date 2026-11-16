@@ -31,7 +31,7 @@ import math
 import re
 from datetime import date
 
-from execution_agent import auto_plan, persist, state
+from execution_agent import auto_plan, persist, state, watchlist
 from execution_agent.broker import MoomooBroker
 from execution_agent.config import ExecutionConfig
 from execution_agent.decision import run_decision_streaming
@@ -245,6 +245,7 @@ def run_auto(
     audit: str | None = None,
     on_step=None,
     stop_check=None,
+    quiet: bool = False,
 ) -> str:
     """Run the whole auto loop once and return a one-message summary.
 
@@ -254,8 +255,24 @@ def run_auto(
     runtime); /auto is paper-only and refuses anything else. ``on_step(label)``
     receives progress; ``stop_check() -> bool`` aborts the loop at the next
     boundary when True. ``audit`` is the audit-log path (skipped when None).
+
+    Progress is deliberately terse: one line per ticker, never the pipeline's
+    per-phase chatter (a 6-ticker scan would otherwise send ~50 messages).
+    ``quiet=True`` (the scheduled daily run) suppresses even the per-ticker
+    lines — only *serious* events reach the phone: orders placed, stop-losses,
+    cancellations, and errors, plus the final summary.
     """
     trading_env = trading_env or config.trading_env
+
+    def _progress(label: str) -> None:
+        """Routine progress — dropped entirely in quiet (scheduled) mode."""
+        if not quiet and on_step is not None:
+            on_step(label)
+
+    def _serious(label: str) -> None:
+        """Orders, stops, errors — always worth a message, even when quiet."""
+        if on_step is not None:
+            on_step(label)
     if trading_env != "SIMULATE":
         return "🔒 /auto is paper-only — it refuses to run in 🔴 REAL mode. Use `/mode paper` first."
 
@@ -281,10 +298,12 @@ def run_auto(
         ],
     )
 
-    # Universe = watchlist ∪ current holdings, deduped, order preserved.
+    # Universe = live watchlist ∪ current holdings, deduped, order preserved.
+    # The watchlist is read fresh from its store (editable via /watchlist), so
+    # an addition takes effect on the very next run, no restart needed.
     full_universe: list[str] = []
     seen: set[str] = set()
-    for ticker in config.watchlist_tickers() + [p.ticker for p in book.positions]:
+    for ticker in watchlist.load(config) + [p.ticker for p in book.positions]:
         key = ticker.upper()
         if key not in seen:
             seen.add(key)
@@ -295,16 +314,24 @@ def run_auto(
     # have saved a ticker to the plan without reaching the /chat store. So the
     # tickers already held in the shared store are skipped; the rest (a new
     # watchlist entry, or a plan ticker missing from the store) are researched
-    # now and folded into today's plan.
+    # now and folded into today's plan. A ticker that *errored* today is also
+    # skipped — re-running a failing pipeline on every same-day /auto would burn
+    # tokens for the same failure; a fresh day retries it naturally.
     stored = auto_plan.load_plan()
     carried_plan: list[dict] = []
     if isinstance(stored, dict) and stored.get("date") == today:
         shared = persist.load_history() or {}
         shared_symbols = {str(k).upper() for k in (shared.get("researches") or {})}
-        to_research = [t for t in full_universe if t.upper() not in shared_symbols]
+        failed_today = {
+            str(e.get("ticker") or "").upper()
+            for e in (stored.get("plan") or [])
+            if e.get("reason") == "error"
+        }
+        skip = shared_symbols | failed_today
+        to_research = [t for t in full_universe if t.upper() not in skip]
         carried_plan = [
             e for e in (stored.get("plan") or [])
-            if str(e.get("ticker") or "").upper() in shared_symbols
+            if str(e.get("ticker") or "").upper() in skip
         ]
         if not to_research:
             return "📚 Already ran /auto today — nothing new to research (watchlist unchanged):\n\n" + _summarize(stored)
@@ -323,7 +350,7 @@ def run_auto(
     # Pass 1 — research every ticker first, so the budget can be split by
     # conviction across *all* the buy ideas before any order goes out.
     candidates: list[dict] = []
-    for ticker in to_research:
+    for index, ticker in enumerate(to_research, start=1):
         if stop_check is not None and stop_check():
             return _stop_and_save()
 
@@ -333,32 +360,35 @@ def run_auto(
         # fetched below so sizing reflects the current price.
         decision = persist.load_today_decision(normalize_symbol(ticker))
         if decision is None:
-            if on_step is not None:
-                on_step(f"🔎 Auto: researching {ticker}…")
+            _progress(f"🔎 Auto: researching {ticker}… ({index}/{len(to_research)})")
             try:
+                # on_step deliberately not forwarded: the pipeline's per-phase
+                # chatter times every universe ticker floods the chat.
                 decision = run_decision_streaming(
                     graph,
                     ticker,
                     today,
                     config=config,
                     portfolio=book,
-                    on_step=on_step,
+                    on_step=None,
                     stop_check=stop_check,
                 )
             except ValueError as exc:  # bad ticker (crypto/forex/unknown)
                 plan_entries.append({"ticker": ticker, "side": None, "reason": "error", "signal": str(exc)})
+                _serious(f"❌ Auto: {ticker} skipped — {exc}")
                 if audit:
                     state.append_event(audit, {"event": "auto_error", "ticker": ticker, "message": str(exc)})
                 continue
             except Exception as exc:  # noqa: BLE001 — one bad run must not kill the loop
                 plan_entries.append({"ticker": ticker, "side": None, "reason": "error", "signal": str(exc)})
+                _serious(f"❌ Auto: {ticker} research failed — {exc}")
                 if audit:
                     state.append_event(audit, {"event": "auto_error", "ticker": ticker, "message": str(exc)})
                 continue
             if decision is None:  # cancelled mid-run by a stop
                 return _stop_and_save()
-        elif on_step is not None:
-            on_step(f"📚 Auto: reusing today's research on {decision.yahoo}")
+        else:
+            _progress(f"📚 Auto: reusing today's research on {decision.yahoo}")
 
         prices = parse_prices(decision.research)
         live = _live_price(broker, decision.moomoo) if decision.side is not None else None
@@ -389,8 +419,7 @@ def run_auto(
         try:
             cancelled = broker.cancel_open_orders(decision.moomoo)
             if cancelled:
-                if on_step is not None:
-                    on_step(f"🧹 Auto: cancelled {cancelled} stale order(s) on {decision.yahoo}")
+                _serious(f"🧹 Auto: cancelled {cancelled} stale order(s) on {decision.yahoo}")
                 if audit:
                     state.append_event(audit, {"event": "auto_cancel", "ticker": decision.yahoo, "count": cancelled})
         except Exception as exc:  # noqa: BLE001 — cancel is best-effort; place today's order regardless
@@ -425,8 +454,7 @@ def run_auto(
                     price=action["limit_price"], time_in_force=action["time_in_force"],
                 )
                 executed = {"order_id": result["order_id"], "order_status": result["order_status"]}
-                if on_step is not None:
-                    on_step(f"✅ Auto: {action['side']} {decision.yahoo} — order {executed['order_id']}")
+                _serious(f"✅ Auto: {action['side']} {decision.yahoo} — order {executed['order_id']}")
                 if audit:
                     state.append_event(
                         audit,
@@ -447,8 +475,7 @@ def run_auto(
                             order_type="STOP", price=prices["stop_loss"], time_in_force="GTC",
                         )
                         stop_order = {"order_id": stop_result["order_id"], "order_status": stop_result["order_status"]}
-                        if on_step is not None:
-                            on_step(f"🛡️ Auto: stop-loss on {decision.yahoo} @ {prices['stop_loss']:g} — order {stop_order['order_id']}")
+                        _serious(f"🛡️ Auto: stop-loss on {decision.yahoo} @ {prices['stop_loss']:g} — order {stop_order['order_id']}")
                         if audit:
                             state.append_event(
                                 audit,

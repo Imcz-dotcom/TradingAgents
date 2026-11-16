@@ -131,11 +131,11 @@ Now you drive everything from Telegram:
 1. Send a ticker — `NVDA`, `0700.HK`, or `/run NVDA`. The bot researches it,
    posting a one-line update on Telegram as each phase finishes (📊 market → 💬
    sentiment → 📰 news → 🏦 fundamentals → ⚖️ debate → 🎯 trader → 🛡️ risk →
-   ✅ final), then replies with the call and summary. It **saves** the result but
-   does **not** trade yet.
-2. Send `/execute` to trade the most recent research of the day, or
-   `/execute NVDA` to trade a specific one. The bot then asks *"How much?"* and
-   dollars/shares, then **Approve / Reject**.
+   ✅ final), then replies with the call and summary **plus tap-able buttons**:
+   ▶️ Execute and 💬 Ask. It **saves** the result but does **not** trade yet.
+2. Tap **▶️ Execute** (or send `/execute`, or `/execute NVDA` for a specific
+   ticker). The bot then asks *"How much?"* and dollars/shares, then
+   **Approve / Reject**.
 3. Tap **Approve** to place the order; the bot then goes back to listening for
    the next ticker.
 
@@ -143,6 +143,39 @@ Now you drive everything from Telegram:
 ticker first, then execute it. One trade runs at a time. To stop the bot, press
 `Ctrl-C` in the laptop terminal. This is the same flow as `run` — the only
 difference is *where* you start it.
+
+### Your assistant commands
+
+Send `/help` any time for this list in chat:
+
+| Command | What it does |
+|---|---|
+| `/status` (or `/report`) | Account report: cash, total assets, each position with **profit/loss**, open orders, today's research, the watchlist. |
+| `/orders` | Open (resting) orders, each with a tap-to-cancel ❌ button. |
+| `/cancel <id>` | Cancel one resting order by its id. |
+| `/watchlist` | Show the `/auto` watchlist. |
+| `/watchlist add AMD` | Add a ticker — takes effect on the **next** `/auto`, no restart. |
+| `/watchlist remove AMD` | Drop a ticker. |
+| `/help` | The full command list. |
+
+The watchlist you edit from the phone is stored in
+`~/.tradingagents/execution/watchlist.json`; the `.env`
+`EXECUTION_AGENT_WATCHLIST` only *seeds* it the first time.
+
+### Hands-off mode: schedule + fill alerts
+
+Two things run quietly in the background while the bot is up:
+
+- **Daily scheduled `/auto`** — set `EXECUTION_AGENT_AUTO_SCHEDULE=09:30` in
+  `.env` and the bot runs `/auto` by itself at that time each day. The scheduled
+  run is **quiet**: no research chatter — you only get a message for orders
+  placed, errors, and the final plan. If you already ran `/auto` that morning,
+  the scheduled run skips (nothing is researched twice).
+  `EXECUTION_AGENT_AUTO_SCHEDULE_BUDGET` sets how much new money it may deploy
+  (0 = manage-only: sell/trim/hold, never buy).
+- **Fill alerts** — the bot checks the broker every couple of minutes and
+  messages you 🎉 when a resting limit/stop order actually fills, so you don't
+  have to watch the market.
 
 ### Fully-automatic `/auto` (paper only)
 
@@ -207,8 +240,21 @@ The verdict is saved to `~/.tradingagents/execution/auto_plan.json`, keyed by
 date (with the day's `budget`). Run `/auto` again the same day and it re-checks
 the watchlist: tickers it already researched today are left alone, but a newly
 added watchlist ticker — or one an earlier run missed — is researched and folded
-in. So editing `EXECUTION_AGENT_WATCHLIST` mid-day takes effect on the next
-`/auto`, not just tomorrow. On a fresh day it re-researches everything.
+in. So `/watchlist add AMD` mid-day takes effect on the next `/auto`, not just
+tomorrow. On a fresh day it re-researches everything.
+
+Several guards keep LLM token costs down:
+
+- **Same-day reuse everywhere** — a ticker researched today (by `/research` or
+  `/auto`) is never re-researched the same day unless you force it with `fresh`.
+- **Failed tickers aren't retried** — a ticker that errored today is skipped by
+  later same-day `/auto` runs instead of re-paying for the same failure; a new
+  day retries it naturally.
+- **Terse progress** — `/auto` sends one line per ticker, not the ~9 per-phase
+  updates each research produces (a 6-ticker scan would be ~50 messages).
+- **Capped chat memory** — `/chat` replays only the last few Q&A turns
+  (`EXECUTION_AGENT_CHAT_HISTORY_TURNS`, default 8) into each prompt, so a long
+  conversation doesn't make every question costlier than the last.
 Separately, if you already researched a ticker interactively today (e.g. a
 morning `/run NVDA`), `/auto` reuses that same-day result instead of re-running
 the full pipeline — it still fetches a fresh live quote to size the order. That
@@ -220,11 +266,15 @@ you ask about and a one-line digest for the rest of today's runs).
 `/auto` refuses to run in `REAL` mode — it is paper-only by design.
 
 ```bash
-# Optional — which tickers /auto researches each day (unset: holdings only)
+# Optional — seeds the watchlist on first use (then /watchlist edits rule)
 EXECUTION_AGENT_WATCHLIST=NVDA,AAPL
 
 # Optional — an "Underweight" sell trims to this fraction of the position
 EXECUTION_AGENT_AUTO_UNDERWEIGHT_TRIM=0.50
+
+# Optional — run /auto automatically every day at this time (quiet reporting)
+EXECUTION_AGENT_AUTO_SCHEDULE=09:30
+EXECUTION_AGENT_AUTO_SCHEDULE_BUDGET=0
 ```
 
 ## How it maps decisions to orders
