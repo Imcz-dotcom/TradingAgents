@@ -225,6 +225,19 @@ def test_plan_bracket_skips_side_without_a_usable_level():
     assert result["target"] == {"price": 200.0, "quantity": 5.0}
 
 
+def test_plan_bracket_fractional_quantity_skips_both_sides():
+    """Moomoo's fractional-trading rules disallow attached stop/target
+    orders on a fractional quantity — a dust remainder gets neither side,
+    flagged ``fractional`` so the caller shows that plainly."""
+    result = auto.plan_bracket(0.3135, {"stop_loss": 170.0, "price_target": 200.0})
+    assert result == {"stop": None, "target": None, "fractional": True}
+
+
+def test_plan_bracket_whole_quantity_is_not_flagged_fractional():
+    result = auto.plan_bracket(5.0, {"stop_loss": 170.0, "price_target": 200.0})
+    assert "fractional" not in result
+
+
 def test_allocate_budget_weighted_split():
     buys = [("NVDA", 2.0), ("AAPL", 1.0)]
     assert auto.allocate_budget(buys, 600.0) == {"NVDA": 400.0, "AAPL": 200.0}
@@ -344,6 +357,17 @@ def test_levels_hint_shows_bracket_when_present():
         bracket={"stop_order_id": 1, "target_order_id": 2, "stop_price": 150.0, "target_price": 180.0},
     )
     assert auto.levels_hint(entry) == "stop 150 / target 180"
+
+
+def test_levels_hint_fractional_dust_shows_plainly_unprotectable():
+    """A fractional remainder can never carry an attached stop/target on
+    Moomoo — must say so plainly, not fall back to a target reference that
+    implies an order that will never actually rest on the broker."""
+    entry = _plan_entry(
+        reason="hold", side=None, price_target=200.0,
+        bracket={"stop_order_id": None, "target_order_id": None, "fractional": True},
+    )
+    assert auto.levels_hint(entry) == "dust — no bracket"
 
 
 def test_levels_hint_bracket_with_only_one_side():
@@ -469,6 +493,31 @@ def test_decide_action_sell_full_exit():
     assert action["side"] == "SELL"
     assert action["quantity"] == 5.0
     assert action["reason"] == "ok"
+
+
+def test_decide_action_sell_whole_quantity_keeps_requested_gtc():
+    """Regression guard: a normal whole-share exit must still honor GTC when
+    the caller asks for it — only a fractional quantity forces DAY."""
+    book = _book(positions=[Position(ticker="NVDA", quantity=5, average_price=100.0)])
+    action = auto.decide_action(
+        _decision(signal="Sell", side="SELL"), _prices(), book, ExecutionConfig(),
+        live=190.0, time_in_force="GTC",
+    )
+    assert action["time_in_force"] == "GTC"
+
+
+def test_decide_action_sell_fractional_full_exit_forces_day():
+    """Moomoo's fractional-trading rules allow only DAY orders — a full exit
+    of a fractional remainder (the raw held quantity, not floored) must not
+    rest as GTC even when the caller requests it."""
+    book = _book(positions=[Position(ticker="WDC", quantity=0.3135, average_price=755.0)])
+    action = auto.decide_action(
+        _decision(yahoo="WDC", signal="Sell", side="SELL"), _prices(), book, ExecutionConfig(),
+        live=287.15, time_in_force="GTC",
+    )
+    assert action["side"] == "SELL"
+    assert action["quantity"] == 0.3135
+    assert action["time_in_force"] == "DAY"
 
 
 def test_decide_action_underweight_trims():
@@ -1083,6 +1132,27 @@ def test_run_auto_backfills_bracket_for_hold_rated_existing_holding(patched):
         {"symbol": "US.NVDA", "side": "SELL", "quantity": 1.0, "price": 150.0, "order_type": "STOP", "time_in_force": "GTC"},
         {"symbol": "US.NVDA", "side": "SELL", "quantity": 1.0, "price": 180.0, "order_type": "NORMAL", "time_in_force": "GTC"},
     ]
+
+
+def test_run_auto_skips_bracket_for_fractional_dust_position(patched):
+    """Real-world case: a 0.3135-share remainder from a corporate action.
+    Moomoo's fractional-trading rules disallow any attached stop/target
+    order on it, so /auto must not even attempt one — no doomed order, and
+    the verdict table must read Hold, not Not worth."""
+    broker = _FakeBroker(positions=[{"symbol": "WDC", "quantity": 0.3135, "average_price": 754.99}])
+    decisions = {"WDC": _decision(yahoo="WDC", signal="Underweight", side="SELL")}
+    apply, _ = patched
+    apply(broker, decisions, {"entry_price": 300.0, "stop_loss": 250.0, "price_target": 350.0})
+
+    auto.run_auto(ExecutionConfig())  # universe = holdings only
+
+    assert broker.orders == []  # no STOP, no target — neither side attempted
+    plan = auto.auto_plan.load_plan()
+    entry = plan["plan"][0]
+    assert entry["reason"] == "hold"
+    assert entry["bracket"]["fractional"] is True
+    assert auto.verdict(entry) == "Hold"
+    assert auto.levels_hint(entry) == "dust — no bracket"
 
 
 def test_run_auto_hold_never_buys_when_opted_out(patched):

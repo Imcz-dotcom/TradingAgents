@@ -55,6 +55,17 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.portfolio import PortfolioContext, Position
 
 
+def is_fractional(quantity: float) -> bool:
+    """Whether ``quantity`` is not a whole number of shares.
+
+    Moomoo's fractional/odd-lot trading rules allow only ``DAY`` orders and
+    disallow any attached stop/target order on a fractional quantity — every
+    caller that sizes an order off a raw held position (which may itself be
+    a fractional dust remainder from a split or spin-off) needs this check.
+    """
+    return abs(quantity - round(quantity)) > 1e-9
+
+
 def sane_limit(limit: float | None, live: float | None, band: float) -> float | None:
     """The limit to place, or None when the level is unusable (→ MARKET).
 
@@ -189,9 +200,16 @@ def plan_bracket(new_qty: float, prices: dict) -> dict:
     a side the research never gave a usable level for. Pure — no I/O.
 
     ``new_qty <= 0`` means nothing is held — no bracket to place at all.
+    Moomoo's fractional/odd-lot trading explicitly disallows "attached
+    orders" (a resting STOP or target) — only whole-share positions can
+    carry a bracket, so a fractional ``new_qty`` (e.g. a dust remainder from
+    a split/spin-off) also skips both sides, flagged via ``"fractional"`` so
+    the caller can show that plainly instead of silently doing nothing.
     """
     if new_qty <= 0:
         return {"stop": None, "target": None}
+    if is_fractional(new_qty):
+        return {"stop": None, "target": None, "fractional": True}
     stop = (
         {"price": prices["stop_loss"], "quantity": new_qty}
         if prices.get("stop_loss") is not None else None
@@ -250,12 +268,16 @@ def decide_action(
             # conditions, but won't fill into a bad tail print.
             limit = round(live * (1 - config.auto_market_sell_buffer), 2)
         order_type = "LIMIT" if limit is not None else "MARKET"
+        # Moomoo's fractional-trading rules allow only DAY orders — a full
+        # exit of a fractional remainder (trim_quantity returns the raw,
+        # possibly-fractional position for a Sell) must not rest as GTC.
+        tif = "DAY" if (order_type != "LIMIT" or is_fractional(qty)) else time_in_force
         return {
             "side": "SELL",
             "quantity": qty,
             "order_type": order_type,
             "limit_price": limit,
-            "time_in_force": time_in_force if order_type == "LIMIT" else "DAY",
+            "time_in_force": tif,
             "reason": "ok",
         }
 
@@ -324,14 +346,21 @@ def levels_hint(entry: dict) -> str:
     A ticker carrying a bracket (any position actually held — freshly bought,
     or a Hold-rated holding backfilled with one) shows the stop/target it's
     literally being protected and exited by — that's the direct answer to
-    "hold till what price". A ticker with no position (``Not worth``) falls
-    back to the research's own target as a re-entry reference. A ``Hold`` on
-    a ticker you don't hold at all has no exit level to show, so it falls
-    back one step further to the trader's entry price — a watch level, not
-    an order. ``-`` only when none of this exists, which is normal: not every
-    research run produces a usable target or entry (see /chat for why).
+    "hold till what price". A fractional/odd-lot remainder (e.g. dust left
+    over from a split or spin-off) shows plainly as unprotectable instead —
+    Moomoo's own fractional-trading rules disallow any attached stop/target
+    order on it, so showing a target here would imply an order that can
+    never actually rest on the broker. A ticker with no position (``Not
+    worth``) falls back to the research's own target as a re-entry
+    reference. A ``Hold`` on a ticker you don't hold at all has no exit level
+    to show, so it falls back one step further to the trader's entry price —
+    a watch level, not an order. ``-`` only when none of this exists, which
+    is normal: not every research run produces a usable target or entry (see
+    /chat for why).
     """
     bracket = entry.get("bracket") or {}
+    if bracket.get("fractional"):
+        return "dust — no bracket"
     parts = []
     if bracket.get("stop_price") is not None:
         parts.append(f"stop {bracket['stop_price']:g}")
@@ -663,8 +692,9 @@ def run_auto(
         # approval: it only manages risk on a position already held, never
         # takes on new exposure, same reasoning as the old single-case stop.
         new_qty = position_qty_after(book, decision.yahoo, action, executed)
+        plan = plan_bracket(new_qty, prices)
         bracket = {"stop_order_id": None, "target_order_id": None, "quantity": new_qty,
-                   "stop_price": None, "target_price": None}
+                   "stop_price": None, "target_price": None, "fractional": plan.get("fractional", False)}
         try:
             for existing in broker.list_orders(decision.moomoo, open_only=True):
                 if existing["order_type"] == "STOP" and existing["side"] == "SELL":
@@ -673,7 +703,6 @@ def run_auto(
             if audit:
                 state.append_event(audit, {"event": "auto_error", "ticker": decision.yahoo, "message": f"bracket cleanup: {exc}"})
 
-        plan = plan_bracket(new_qty, prices)
         if plan["stop"] is not None:
             try:
                 stop_result = broker.place_order(

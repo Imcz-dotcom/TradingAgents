@@ -308,13 +308,16 @@ Approve tap — it only manages risk on a position you already approved into
 BUY.
 
 **Fractional dust positions** (a leftover like `0.3135` shares from a split or
-spin-off) are handled, not skipped: an `Underweight` trim that floors to zero
-units on a sub-1-share position reads as `Hold`, not `Not worth` — you still
-hold it — and the bracket/full-exit sizing sends that exact fractional
-quantity to Moomoo rather than truncating it away. Whether Moomoo's own
-backend accepts a fractional order quantity depends on your account's
-fractional-trading entitlement; a rejection shows up in the audit log and that
-side of the bracket simply stays unset, same as any other order rejection.
+spin-off) are recognized, not mistaken for "not held": an `Underweight` trim
+that floors to zero units on a sub-1-share position reads as `Hold`, not `Not
+worth`. The bracket itself, though, is skipped outright for a fractional
+quantity rather than attempted — Moomoo's fractional/odd-lot trading rules
+disallow any "attached order" (a resting stop or target) on a fractional
+share, so it would only fail every run. The `Levels` column shows `dust — no
+bracket` for these instead of a target it could never actually place. A full
+**Sell** rating still exits the whole fractional remainder directly via a
+plain order (not a bracket), since Moomoo's fractional rules do allow a plain
+market/limit order on fractional shares — just not GTC or an attached stop.
 
 One current limitation: the take-profit always exits the **full** position at
 the target price — there's no partial "sell half here, let the rest ride"
