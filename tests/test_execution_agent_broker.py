@@ -98,6 +98,7 @@ def fake_moomoo(monkeypatch):
         ModifyOrderOp=types.SimpleNamespace(CANCEL="CANCEL"),
         OrderStatus=types.SimpleNamespace(),
         TrdMarket=types.SimpleNamespace(NONE="N/A"),
+        Currency=types.SimpleNamespace(USD="USD", HKD="HKD"),
         OpenQuoteContext=QuoteCtx,
         OpenSecTradeContext=TradeCtx,
     )
@@ -143,7 +144,7 @@ def test_place_order_buy(fake_moomoo):
     args = trade.place_args
     assert args["code"] == "US.NVDA"
     assert args["trd_side"] == "BUY"
-    assert args["qty"] == 10            # float 10.0 -> int 10
+    assert args["qty"] == 10.0
     assert args["order_type"] == "MARKET"
     assert args["trd_env"] == "SIMULATE"
     assert args["acc_id"] == 123
@@ -165,6 +166,17 @@ def test_place_order_sell_real_env(fake_moomoo):
     assert args["trd_env"] == "REAL"
     assert args["acc_id"] == 7
     assert args["qty"] == 3
+
+
+def test_place_order_fractional_quantity_is_not_truncated(fake_moomoo):
+    """A dust position (e.g. 0.3135 shares left over from a corporate action)
+    must reach Moomoo as-is — Moomoo's own SDK casts qty to float, so our
+    adapter must not pre-truncate it to a zero-quantity order."""
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.place_order("US.WDC", "SELL", 0.3135)
+
+    assert fake_moomoo["created"][0].place_args["qty"] == 0.3135
 
 
 def test_place_order_raises_when_no_account_for_env(fake_moomoo):
@@ -223,6 +235,9 @@ def test_place_order_limit_price(fake_moomoo):
 
 
 def test_place_order_stop(fake_moomoo):
+    """A plain STOP has no limit leg — Moomoo wants the trigger in its own
+    ``aux_price`` parameter ("missing required parameter Trigger price" is
+    exactly what Moomoo says if the trigger is sent via ``price`` instead)."""
     broker = MoomooBroker(trading_env="SIMULATE")
 
     result = broker.place_order("US.NVDA", "SELL", 5.0, order_type="STOP", price=172.0)
@@ -230,7 +245,8 @@ def test_place_order_stop(fake_moomoo):
     assert result == {"order_id": 999, "order_status": "SUBMITTED"}
     args = fake_moomoo["created"][0].place_args
     assert args["order_type"] == "STOP"
-    assert args["price"] == 172.0
+    assert args["aux_price"] == 172.0
+    assert args["price"] == 0.0  # no limit leg on a plain stop-market
     assert args["trd_side"] == "SELL"
 
 
@@ -241,12 +257,33 @@ def test_place_order_stop_requires_price(fake_moomoo):
         broker.place_order("US.NVDA", "SELL", 5.0, order_type="STOP")
 
 
-def test_place_order_time_in_force_gtc(fake_moomoo):
-    broker = MoomooBroker(trading_env="SIMULATE")
+def test_place_order_time_in_force_gtc_on_real(fake_moomoo):
+    fake_moomoo["acc_data"] = pd.DataFrame(
+        {"acc_id": [7], "trd_env": ["REAL"], "trdmarket_auth": [["US"]]}
+    )
+    broker = MoomooBroker(trading_env="REAL")
 
     broker.place_order("US.NVDA", "BUY", 10.0, price=189.5, time_in_force="GTC")
 
     assert fake_moomoo["created"][0].place_args["time_in_force"] == "GTC"
+
+
+def test_place_order_gtc_downgrades_to_day_on_simulate(fake_moomoo):
+    """Moomoo's paper environment rejects GTC outright ("Paper trading does
+    not support GTC orders") — silently fall back to DAY instead of erroring."""
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.place_order("US.NVDA", "BUY", 10.0, price=189.5, time_in_force="GTC")
+
+    assert fake_moomoo["created"][0].place_args["time_in_force"] == "DAY"
+
+
+def test_place_order_day_on_simulate_is_unaffected(fake_moomoo):
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.place_order("US.NVDA", "BUY", 10.0, price=189.5, time_in_force="DAY")
+
+    assert fake_moomoo["created"][0].place_args["time_in_force"] == "DAY"
 
 
 def test_cancel_open_orders_cancels_only_open_limits(fake_moomoo):
@@ -516,3 +553,159 @@ def test_list_orders_canonicalizes_numeric_statuses(fake_moomoo, monkeypatch):
     (order,) = broker.list_orders()
 
     assert order["order_status"] == "FILLED_ALL"  # canonical name, not "11"
+
+
+# ---- multi-account logins (HK-only + US accounts for the same trd_env) -----
+
+
+def _two_account_fixture(fake_moomoo):
+    """An HK-cash paper account (listed first) plus a US-margin one."""
+    fake_moomoo["acc_data"] = pd.DataFrame(
+        {
+            "acc_id": [5804383, 2261948],
+            "trd_env": ["SIMULATE", "SIMULATE"],
+            "trdmarket_auth": [["HK"], ["US"]],
+        }
+    )
+
+
+def test_default_acc_id_prefers_us_over_hk_listed_first(fake_moomoo):
+    _two_account_fixture(fake_moomoo)
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    result = broker.get_account()
+
+    trade = fake_moomoo["created"][0]
+    assert trade.accinfo_args["acc_id"] == 2261948  # US account, not the first-listed HK one
+
+
+def test_get_positions_merges_across_every_account(fake_moomoo, monkeypatch):
+    _two_account_fixture(fake_moomoo)
+    by_acc = {
+        5804383: pd.DataFrame({"code": [], "qty": [], "cost_price": []}),
+        2261948: pd.DataFrame({"code": ["US.NVDA"], "qty": [1], "cost_price": [159.85]}),
+    }
+
+    class TradeCtx:
+        def __init__(self, **kw):
+            fake_moomoo["created"].append(self)
+
+        def get_acc_list(self):
+            return fake_moomoo["acc_ret"], fake_moomoo["acc_data"]
+
+        def position_list_query(self, *, trd_env, acc_id):
+            return 0, by_acc[acc_id]
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(broker_mod._moomoo(), "OpenSecTradeContext", TradeCtx)
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    positions = broker.get_positions()
+
+    # The NVDA position in the *second* (US) account is not lost even though
+    # the HK account (queried first) holds nothing.
+    assert [p["symbol"] for p in positions] == ["NVDA"]
+
+
+def test_list_orders_merges_across_every_account(fake_moomoo, monkeypatch):
+    _two_account_fixture(fake_moomoo)
+    by_acc = {
+        5804383: pd.DataFrame(
+            {"order_id": [], "code": [], "trd_side": [], "qty": [],
+             "price": [], "order_type": [], "order_status": []}
+        ),
+        2261948: pd.DataFrame(
+            {"order_id": [7], "code": ["US.NVDA"], "trd_side": ["BUY"], "qty": [1],
+             "price": [160.0], "order_type": ["NORMAL"], "order_status": ["SUBMITTED"]}
+        ),
+    }
+
+    class TradeCtx:
+        def __init__(self, **kw):
+            fake_moomoo["created"].append(self)
+
+        def get_acc_list(self):
+            return fake_moomoo["acc_ret"], fake_moomoo["acc_data"]
+
+        def order_list_query(self, *, trd_env, acc_id, code=None):
+            return 0, by_acc[acc_id]
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(broker_mod._moomoo(), "OpenSecTradeContext", TradeCtx)
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    orders = broker.list_orders()
+
+    assert [o["order_id"] for o in orders] == [7]
+
+
+def test_cancel_order_tries_every_account_until_one_succeeds(fake_moomoo, monkeypatch):
+    _two_account_fixture(fake_moomoo)
+    calls = []
+
+    class TradeCtx:
+        def __init__(self, **kw):
+            fake_moomoo["created"].append(self)
+
+        def get_acc_list(self):
+            return fake_moomoo["acc_ret"], fake_moomoo["acc_data"]
+
+        def modify_order(self, op, order_id, qty, price, *, trd_env, acc_id):
+            calls.append(acc_id)
+            # Only the US account (queried second) actually holds this order.
+            return (0, "ok") if acc_id == 2261948 else (1, "not found on this account")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(broker_mod._moomoo(), "OpenSecTradeContext", TradeCtx)
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.cancel_order(7)  # must not raise — the second account accepts it
+
+    assert calls == [5804383, 2261948]
+
+
+def test_cancel_order_raises_when_no_account_accepts(fake_moomoo, monkeypatch):
+    _two_account_fixture(fake_moomoo)
+
+    class TradeCtx:
+        def __init__(self, **kw):
+            fake_moomoo["created"].append(self)
+
+        def get_acc_list(self):
+            return fake_moomoo["acc_ret"], fake_moomoo["acc_data"]
+
+        def modify_order(self, op, order_id, qty, price, **kw):
+            return 1, "no such order"
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(broker_mod._moomoo(), "OpenSecTradeContext", TradeCtx)
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    with pytest.raises(RuntimeError, match="cancel failed for order 7"):
+        broker.cancel_order(7)
+
+
+def test_place_order_rounds_limit_price_to_two_decimals(fake_moomoo):
+    """Moomoo rejects a price with too many decimals ("The precision of
+    Price in Place Order does not meet the specification")."""
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.place_order("US.NVDA", "BUY", 10.0, price=159.59333333)
+
+    assert fake_moomoo["created"][0].place_args["price"] == 159.59
+
+
+def test_place_order_rounds_stop_trigger_to_two_decimals(fake_moomoo):
+    broker = MoomooBroker(trading_env="SIMULATE")
+
+    broker.place_order("US.NVDA", "SELL", 5.0, order_type="STOP", price=172.567)
+
+    assert fake_moomoo["created"][0].place_args["aux_price"] == 172.57

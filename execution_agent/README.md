@@ -177,22 +177,51 @@ Two things run quietly in the background while the bot is up:
   messages you 🎉 when a resting limit/stop order actually fills, so you don't
   have to watch the market.
 
-### Fully-automatic `/auto` (paper only)
+### Fully-automatic `/auto`
 
 `/auto` is a **daily-budget manager**. It reads your account, researches the
-universe, and acts by itself — no approval — but it *sizes by the research's
-conviction*, not a fixed amount:
+universe, and decides buy/sell by itself — *sized by the research's
+conviction*, not a fixed amount. On **paper** it places every decided trade
+immediately, with no approval step. On **🔴 REAL**, deciding autonomously is
+one thing — spending real money autonomously is another, so every trade it
+wants to place is sent to you as an **Approve / Reject** tap first, exactly
+like `/execute`; a timeout or Reject skips that trade (never a silent yes).
+Protective stop-losses and cancelling a superseded resting order aren't
+re-approved — they only reduce risk on a position you already approved into.
 
 - **`/auto`** — "manage my account": research the watchlist + holdings and
   sell/trim/hold per the analysis, but deploy **no new cash**.
 - **`/auto 500`** — "I have $500 today": split that budget across the buy ideas
-  by conviction (`Buy` earns twice an `Overweight`), buy at the trader's entry
-  price as a limit order, and place a protective stop-loss after a market fill.
+  by conviction (`Buy` earns twice an `Overweight`) and buy at the trader's
+  entry price as a limit order.
 
 The **"what to buy" list** is your *watchlist* (`.env` `EXECUTION_AGENT_WATCHLIST`)
 **plus** your *current holdings*, read live from the account. So `/auto` manages
 what you own and, when you give it a budget, deploys the new cash across the
 watchlist ideas.
+
+The reply itself is deliberately terse — a one-line verdict per ticker in a
+table, nothing else:
+
+```
+Ticker  Verdict
+------  -----------
+NVDA    Sell
+AAPL    Hold
+WDC     Buy @ 170.50
+INTC    Buy @ 64.56?
+```
+
+`Buy`/`Sell` alone means the order already executed (a market fill). `Buy @
+X`/`Sell @ X` — **no** `?` — means a real resting LIMIT order is sitting on
+Moomoo right now; it fires automatically the instant price reaches `X`,
+nothing further needed from you. `Buy @ X?`/`Sell @ X?` — **with** the `?` —
+means **nothing is set anywhere**: it's only the price that *would* trigger a
+buy/sell once you give `/auto` a budget, a live price becomes available, or
+you approve it on REAL. `Not worth` means a Sell/Underweight call on a ticker
+you don't hold, so there's nothing to act on. For the reasoning behind any of
+these, ask `/chat <ticker> ...` — the full analyst reports and debate live
+there, not in the summary.
 
 ```mermaid
 flowchart TD
@@ -207,46 +236,124 @@ flowchart TD
     Rating -->|Sell| Sell[SELL full exit at target]
     Rating -->|Underweight| Trim[SELL a trim at target]
     Rating -->|Hold / REVIEW| Hold[No order]
-    Buy --> Stop[After a market buy: protective stop-loss GTC]
+    Buy --> Bracket[Ensure bracket: stop-loss + take-profit<br/>sized to whatever is actually held]
+    Hold --> Bracket
+    NoBuy --> Bracket
     Sell --> Save[Save today's verdict]
     Trim --> Save
-    Hold --> Save
-    NoBuy --> Save
-    Stop --> Save
+    Bracket --> Save
 ```
 
 | Rating | Action |
 |---|---|
 | Buy / Overweight | BUY — split of the budget (Buy 2×, Overweight 1×) |
-| Hold | no order |
+| Hold | no order (unless `AUTO_BUY_HOLD_PULLBACK` — see below) |
 | Underweight | SELL a **trim** (default half — see `AUTO_UNDERWEIGHT_TRIM`) |
 | Sell | SELL a **full exit** |
 
-Orders are **paper only**. It follows the research's own levels — buy at the
-trader's entry price, sell at the portfolio manager's price target — as limit
-orders (falling back to a market order when no usable level exists). After a
-*market* buy it also places a protective stop-loss at the trader's stop level; a
-pending limit buy just records the stop for a later run.
+It follows the research's own levels — buy at the trader's entry price, sell
+at the portfolio manager's price target — as limit orders. A **buy** with no
+usable entry price falls back to a plain MARKET order. A **sell** never does:
+with no usable target, it places a LIMIT a small buffer
+(`AUTO_MARKET_SELL_BUFFER`, default 2%) below the live price instead of a raw
+MARKET order — it still fills almost immediately in normal conditions, but
+can't be dumped far below where the stock is actually trading into a bad or
+illiquid print. (A buy has no equivalent concern — paying slightly more than
+intended on an unprotected entry isn't the same risk as selling into a crash.)
+
+### Opt-in: buy the pullback on a Hold
+
+A `Hold` rating means "don't buy" by default — no amount of budget changes
+that. But the trader sometimes states an entry price *even on a Hold* (e.g.
+"I'd get interested below $340"), and setting
+`EXECUTION_AGENT_AUTO_BUY_HOLD_PULLBACK=true` tells `/auto` to act on that: it
+places a low-conviction resting **LIMIT** buy at that entry price for a
+Hold-rated ticker you don't already hold — **only** when that price is
+genuinely below the live price (a real pullback, not a level that would fill
+immediately). It never falls back to MARKET, since buying at today's price
+would defeat the whole point of waiting. This weighs half as much as an
+Overweight when splitting the budget, so a genuine Buy/Overweight call always
+gets priority. Off by default — the LLM doesn't reliably mean "buy here on a
+dip" every time it states a number on a Hold, so this is your call to turn
+on, not the default reading of that field.
+
+### Protective bracket: stop-loss + take-profit, on autopilot
+
+Every `/auto` run checks **every ticker it currently holds** — not just ones
+it buys that run — and makes sure a full bracket is resting on Moomoo:
+
+- a **stop-loss** (`STOP`, GTC) at the trader's stop level, and
+- a **take-profit** (limit `SELL`, GTC) at the portfolio manager's price
+  target,
+
+both sized to whatever is actually held. This covers a position bought via
+`/auto` itself, one bought interactively through `/execute`, or one you held
+before this feature existed — the first `/auto` run after you have it will
+backfill the bracket onto it. A pending limit buy that hasn't filled yet has
+nothing to protect, so the bracket waits for a later run once it has.
+
+**Both orders sit directly on Moomoo, not inside this bot.** Moomoo's own
+matching engine fires them the instant price crosses the level — completely
+independent of whether the bot is running. Moomoo has no native "one cancels
+other" bracket type, though, so once one side fires the other is left resting
+against shares that no longer exist; the bot's background fill-watcher (polls
+every couple of minutes) notices and cancels that now-stale sibling, sending
+you a message. If the bot happens to be offline when a side fires, the sale
+still goes through fine on Moomoo's end — only the sibling cleanup is delayed
+until the bot is back and polls again.
+
+On **🔴 REAL**, the bracket is placed/replaced automatically, without an
+Approve tap — it only manages risk on a position you already approved into
+(sets a floor, locks in a gain), never takes on new exposure, unlike a fresh
+BUY.
+
+**Fractional dust positions** (a leftover like `0.3135` shares from a split or
+spin-off) are handled, not skipped: an `Underweight` trim that floors to zero
+units on a sub-1-share position reads as `Hold`, not `Not worth` — you still
+hold it — and the bracket/full-exit sizing sends that exact fractional
+quantity to Moomoo rather than truncating it away. Whether Moomoo's own
+backend accepts a fractional order quantity depends on your account's
+fractional-trading entitlement; a rejection shows up in the audit log and that
+side of the bracket simply stays unset, same as any other order rejection.
+
+One current limitation: the take-profit always exits the **full** position at
+the target price — there's no partial "sell half here, let the rest ride"
+split, because today's research only ever gives one target price, not a
+scale-out plan. Teaching the LLM to produce its own scale-out plan would be a
+bigger change to the core research pipeline, not just this execution layer.
 
 Limit orders rest on Moomoo's side, so they survive the bot being offline — and
-the agent decides how long based on the research's own **Time Horizon**: a long
-call ("3-6 months") places a **GTC** order (rests until filled or cancelled), a
-short call ("1-2 weeks") places a **DAY** order. The protective stop-loss is
-always **GTC**. Because GTC orders can linger, each fresh run first **cancels
-the prior day's open orders** on each ticker before placing new ones, so a stale
-limit can't double-fill or fire against a superseded verdict.
+the agent decides how long the *entry* order rests based on the research's own
+**Time Horizon**: a long call ("3-6 months") places a **GTC** order (rests
+until filled or cancelled), a short call ("1-2 weeks") places a **DAY** order.
+The bracket is always **GTC**. Because GTC orders can linger, each fresh run
+first **cancels the prior day's open orders** on each ticker before placing
+new ones (including the previous bracket, which is always replaced fresh each
+run), so a stale limit can't double-fill or fire against a superseded verdict.
+
+**Paper (SIMULATE) quirk**: Moomoo's paper environment rejects GTC outright
+("Paper trading does not support GTC orders"). Every GTC request is silently
+downgraded to DAY when not trading REAL, so this never fails — it just means
+a paper order dies at that day's close regardless of the research's time
+horizon, which costs nothing functionally since `/auto` already cancels and
+reissues every order fresh on each run anyway.
 
 The verdict is saved to `~/.tradingagents/execution/auto_plan.json`, keyed by
-date (with the day's `budget`). Run `/auto` again the same day and it re-checks
-the watchlist: tickers it already researched today are left alone, but a newly
-added watchlist ticker — or one an earlier run missed — is researched and folded
-in. So `/watchlist add AMD` mid-day takes effect on the next `/auto`, not just
-tomorrow. On a fresh day it re-researches everything.
+date (with the day's `budget`). Run `/auto` again the same day and every ticker
+still goes through the decide + bracket-ensure step — that's what keeps the
+protective bracket fresh even on a run where nothing else changed — but the
+research itself is never re-paid for: a ticker already researched today (by
+`/research` or an earlier `/auto`) reuses that cached result for free. A newly
+added watchlist ticker gets freshly researched right alongside the reused
+ones, so `/watchlist add AMD` mid-day takes effect on the very next `/auto`,
+not just tomorrow. On a fresh day everything is researched from scratch.
 
 Several guards keep LLM token costs down:
 
 - **Same-day reuse everywhere** — a ticker researched today (by `/research` or
   `/auto`) is never re-researched the same day unless you force it with `fresh`.
+  Re-deciding and refreshing its bracket on a later same-day `/auto` call is
+  cheap (broker calls only, no LLM) and happens regardless.
 - **Failed tickers aren't retried** — a ticker that errored today is skipped by
   later same-day `/auto` runs instead of re-paying for the same failure; a new
   day retries it naturally.
@@ -263,7 +370,12 @@ shared result lives in `~/.tradingagents/execution/research_history.json`.
 questions about any ticker `/auto` looked at — including cross-ticker ones like
 "how does NVDA compare to AAPL?" (`/chat` shows the full research for the ticker
 you ask about and a one-line digest for the rest of today's runs).
-`/auto` refuses to run in `REAL` mode — it is paper-only by design.
+
+**Scheduled `/auto` on REAL** asks for approval exactly the same way: each
+trade the scheduled run wants to place still waits for your tap, it just does
+so quietly (no "researching…" chatter) — so a 🔴 REAL morning schedule queues
+up approval prompts for you to tap through instead of trading unsupervised
+while you're asleep.
 
 ```bash
 # Optional — seeds the watchlist on first use (then /watchlist edits rule)

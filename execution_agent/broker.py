@@ -31,6 +31,11 @@ def _moomoo():
 # states are terminal and left alone.
 OPEN_STATUSES = {"SUBMITTED", "SUBMITTING", "WAITING_SUBMIT", "FILLED_PART"}
 
+# Market preference order for picking one "default" account out of several for
+# the same trd_env (see MoomooBroker._default_acc_id). US first since the
+# agent's tickers are Yahoo/US-centric by default.
+_PREFERRED_MARKETS = ("US", "HK", "CN", "SG", "MY", "JP", "AU")
+
 
 def _opt_float(value) -> float | None:
     """A float, or None when the broker omitted the column or sent junk/NaN."""
@@ -138,8 +143,12 @@ class MoomooBroker:
     ) -> dict:
         """Place an order and return ``{"order_id", "order_status"}``.
 
-        ``side`` is "BUY" or "SELL"; ``quantity`` is whole units. Defaults to a
-        MARKET order (price ignored, sent as 0.0). Pass ``price`` to place a
+        ``side`` is "BUY" or "SELL"; ``quantity`` is in units of the instrument
+        (most callers compute whole shares, but a full exit or bracket on a
+        fractional holding — e.g. a dust remainder from a split/spin-off —
+        passes that fractional quantity straight through; Moomoo's own SDK
+        casts ``qty`` to ``float``, so this never truncates it to zero).
+        Defaults to a MARKET order (price ignored, sent as 0.0). Pass ``price`` to place a
         NORMAL (limit) order at that price. Pass ``order_type="STOP"`` with a
         ``price`` to place a stop order (e.g. a protective stop-loss) at that
         trigger. ``time_in_force`` is "DAY" (dies at close) or "GTC" (rests until
@@ -147,32 +156,50 @@ class MoomooBroker:
         being offline. The caller is responsible for sanity-checking the level
         against the live quote. The account is looked up for ``trading_env`` so a
         SIMULATE run can never touch a REAL account id by accident.
+
+        Moomoo's paper (SIMULATE) environment rejects GTC outright — "Paper
+        trading does not support GTC orders" — so a GTC request is silently
+        downgraded to DAY here when not trading REAL. This affects paper only:
+        the order still gets replaced on every fresh ``/auto`` run regardless
+        (stale orders are cancelled and reissued each time), so losing true
+        multi-day persistence in paper costs nothing functionally — it just
+        means a paper order may need the next day's exchange session to still
+        be resting, whereas DAY dies at that day's close either way.
         """
         with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
+            if time_in_force == "GTC" and self.trading_env != "REAL":
+                time_in_force = "DAY"
             acc_id = self._resolve_acc_id(trd_ctx, trd_env, moomoo, symbol)
             trd_side = moomoo.TrdSide.BUY if side == "BUY" else moomoo.TrdSide.SELL
 
-            # STOP carries its trigger in ``price``; NORMAL (limit) carries a
-            # limit price; MARKET ignores price (send 0.0).
+            # A plain STOP (stop-market) has no limit component — its trigger
+            # goes in Moomoo's dedicated ``aux_price`` parameter, not ``price``
+            # (that confusion is exactly what produced "missing required
+            # parameter Trigger price" from Moomoo's own API: ``price`` is the
+            # limit leg, meaningless for a stop-market order). NORMAL (limit)
+            # carries its level in ``price``; MARKET ignores price (send 0.0).
+            aux_price = None
             if order_type == "STOP":
                 if price is None:
                     raise ValueError("a STOP order needs a trigger price")
-                order_price = float(price)
+                aux_price = round(float(price), 2)
+                order_price = 0.0
             elif price is not None:
                 order_type = "NORMAL"
-                order_price = float(price)
+                order_price = round(float(price), 2)
             else:
                 order_price = 0.0
 
             ret, data = trd_ctx.place_order(
                 price=order_price,
-                qty=int(quantity),
+                qty=float(quantity),
                 code=symbol,
                 trd_side=trd_side,
                 order_type=getattr(moomoo.OrderType, order_type),
                 trd_env=trd_env,
                 acc_id=acc_id,
                 time_in_force=getattr(moomoo.TimeInForce, time_in_force),
+                aux_price=aux_price,
             )
             if ret != moomoo.RET_OK:
                 raise RuntimeError(f"order failed for {symbol}: {data}")
@@ -218,15 +245,24 @@ class MoomooBroker:
             return cancelled
 
     def get_account(self) -> dict:
-        """The account's cash, currency and worth for the first ``trading_env`` account.
+        """The account's cash, currency and worth for the preferred ``trading_env`` account.
 
         Returns ``{"cash", "currency", "total_assets", "market_value"}`` — the
-        last two are ``None`` when the broker omits them. Uses the first account
-        in the list (not market-matched), since the whole book is being read here.
+        last two are ``None`` when the broker omits them. A multi-market login
+        (e.g. a separate HK-only and US paper account) reports one account's
+        figures, not a sum — cash in different currencies can't be added
+        meaningfully — so :meth:`_default_acc_id` is biased toward the account
+        that actually trades (see its docstring).
+
+        ``accinfo_query``'s own SDK default converts every figure to HKD
+        regardless of which account/market is queried; TradingAgents' tickers
+        are USD-centric, so USD is requested explicitly here.
         """
         with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
             acc_id = self._default_acc_id(trd_ctx, trd_env, moomoo)
-            ret, data = trd_ctx.accinfo_query(trd_env=trd_env, acc_id=acc_id)
+            ret, data = trd_ctx.accinfo_query(
+                trd_env=trd_env, acc_id=acc_id, currency=moomoo.Currency.USD
+            )
             if ret != moomoo.RET_OK:
                 raise RuntimeError(f"account query failed: {data}")
             row = data.iloc[0]
@@ -238,7 +274,7 @@ class MoomooBroker:
             }
 
     def get_positions(self) -> list[dict]:
-        """Open positions with cost, worth and profit/loss.
+        """Open positions with cost, worth and profit/loss, across every account.
 
         Returns ``[{"symbol", "quantity", "average_price", "current_price",
         "market_value", "pl_value", "pl_ratio"}]`` — the last four are ``None``
@@ -246,86 +282,103 @@ class MoomooBroker:
         (``US.NVDA``) and are translated to Yahoo form via :func:`to_yahoo` so
         they match the watchlist and ``PortfolioContext``. Rows with
         non-positive quantity are skipped.
+
+        A multi-market login can split holdings across several accounts for the
+        same ``trd_env`` (e.g. an HK-only paper account alongside a US one);
+        reading only one would silently hide positions held in the other, so
+        every matching account is queried and the results combined.
         """
         with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
-            acc_id = self._default_acc_id(trd_ctx, trd_env, moomoo)
-            ret, data = trd_ctx.position_list_query(trd_env=trd_env, acc_id=acc_id)
-            if ret != moomoo.RET_OK:
-                raise RuntimeError(f"position query failed: {data}")
             positions: list[dict] = []
-            for _, row in data.iterrows():
-                qty = float(row.get("qty") or 0.0)
-                if qty <= 0:
-                    continue
-                positions.append(
-                    {
-                        "symbol": to_yahoo(str(row["code"])),
-                        "quantity": qty,
-                        "average_price": float(row.get("cost_price") or 0.0),
-                        "current_price": _opt_float(row.get("nominal_price")),
-                        "market_value": _opt_float(row.get("market_val")),
-                        "pl_value": _opt_float(row.get("pl_val")),
-                        "pl_ratio": _opt_float(row.get("pl_ratio")),
-                    }
+            for acc_id in self._env_accounts(trd_ctx, trd_env, moomoo)["acc_id"]:
+                ret, data = trd_ctx.position_list_query(
+                    trd_env=trd_env, acc_id=int(acc_id)
                 )
+                if ret != moomoo.RET_OK:
+                    raise RuntimeError(f"position query failed: {data}")
+                for _, row in data.iterrows():
+                    qty = float(row.get("qty") or 0.0)
+                    if qty <= 0:
+                        continue
+                    positions.append(
+                        {
+                            "symbol": to_yahoo(str(row["code"])),
+                            "quantity": qty,
+                            "average_price": float(row.get("cost_price") or 0.0),
+                            "current_price": _opt_float(row.get("nominal_price")),
+                            "market_value": _opt_float(row.get("market_val")),
+                            "pl_value": _opt_float(row.get("pl_val")),
+                            "pl_ratio": _opt_float(row.get("pl_ratio")),
+                        }
+                    )
             return positions
 
     def list_orders(self, symbol: str | None = None, *, open_only: bool = False) -> list[dict]:
-        """Today's orders (optionally only the still-resting ones) for the account.
+        """Today's orders (optionally only the still-resting ones), across every account.
 
         Returns ``[{"order_id", "symbol" (Yahoo form), "side", "quantity",
         "price", "order_type", "order_status"}]``. ``open_only=True`` keeps just
         the orders still resting on the book (cancelable); the full list also
         carries filled/cancelled orders, which the serve bot's fill-watcher
-        diffs against to notice "your order filled" transitions.
+        diffs against to notice "your order filled" transitions. Every account
+        for ``trd_env`` is queried (see :meth:`get_positions` for why), so an
+        order placed on a non-default account is never missed.
         """
         with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
-            acc_id = self._default_acc_id(trd_ctx, trd_env, moomoo)
-            kwargs = {"trd_env": trd_env, "acc_id": acc_id}
-            if symbol is not None:
-                kwargs["code"] = symbol
-            ret, data = trd_ctx.order_list_query(**kwargs)
-            if ret != moomoo.RET_OK:
-                raise RuntimeError(f"order list failed: {data}")
             orders: list[dict] = []
-            for _, row in data.iterrows():
-                # Canonical status name (numeric enums resolved), so consumers
-                # like the fill watcher compare one spelling.
-                status = _status_name(row.get("order_status"), moomoo)
-                if open_only and status not in OPEN_STATUSES:
-                    continue
-                try:
-                    order_id = int(row["order_id"])
-                except (TypeError, ValueError):
-                    continue
-                code = str(row.get("code") or "")
-                try:
-                    yahoo = to_yahoo(code)
-                except ValueError:
-                    yahoo = code
-                orders.append(
-                    {
-                        "order_id": order_id,
-                        "symbol": yahoo,
-                        "side": str(row.get("trd_side") or ""),
-                        "quantity": float(row.get("qty") or 0.0),
-                        "price": _opt_float(row.get("price")),
-                        "order_type": str(row.get("order_type") or ""),
-                        "order_status": status,
-                    }
-                )
+            for acc_id in self._env_accounts(trd_ctx, trd_env, moomoo)["acc_id"]:
+                kwargs = {"trd_env": trd_env, "acc_id": int(acc_id)}
+                if symbol is not None:
+                    kwargs["code"] = symbol
+                ret, data = trd_ctx.order_list_query(**kwargs)
+                if ret != moomoo.RET_OK:
+                    raise RuntimeError(f"order list failed: {data}")
+                for _, row in data.iterrows():
+                    # Canonical status name (numeric enums resolved), so
+                    # consumers like the fill watcher compare one spelling.
+                    status = _status_name(row.get("order_status"), moomoo)
+                    if open_only and status not in OPEN_STATUSES:
+                        continue
+                    try:
+                        order_id = int(row["order_id"])
+                    except (TypeError, ValueError):
+                        continue
+                    code = str(row.get("code") or "")
+                    try:
+                        yahoo = to_yahoo(code)
+                    except ValueError:
+                        yahoo = code
+                    orders.append(
+                        {
+                            "order_id": order_id,
+                            "symbol": yahoo,
+                            "side": str(row.get("trd_side") or ""),
+                            "quantity": float(row.get("qty") or 0.0),
+                            "price": _opt_float(row.get("price")),
+                            "order_type": str(row.get("order_type") or ""),
+                            "order_status": status,
+                        }
+                    )
             return orders
 
     def cancel_order(self, order_id: int) -> None:
-        """Cancel one resting order by id, raising a clear error on failure."""
+        """Cancel one resting order by id, raising a clear error on failure.
+
+        The order may rest on any of this ``trd_env``'s accounts (see
+        :meth:`get_positions`), so a cancel is attempted against each in turn
+        and stops at the first one Moomoo accepts.
+        """
         with self._trade_ctx() as (moomoo, trd_ctx, trd_env):
-            acc_id = self._default_acc_id(trd_ctx, trd_env, moomoo)
-            ret, data = trd_ctx.modify_order(
-                moomoo.ModifyOrderOp.CANCEL, int(order_id), 0, 0,
-                trd_env=trd_env, acc_id=acc_id,
-            )
-            if ret != moomoo.RET_OK:
-                raise RuntimeError(f"cancel failed for order {order_id}: {data}")
+            last_data = None
+            for acc_id in self._env_accounts(trd_ctx, trd_env, moomoo)["acc_id"]:
+                ret, data = trd_ctx.modify_order(
+                    moomoo.ModifyOrderOp.CANCEL, int(order_id), 0, 0,
+                    trd_env=trd_env, acc_id=int(acc_id),
+                )
+                if ret == moomoo.RET_OK:
+                    return
+                last_data = data
+            raise RuntimeError(f"cancel failed for order {order_id}: {last_data}")
 
     def _env_accounts(self, trd_ctx, trd_env, moomoo):
         """The account rows for ``trd_env``, or a clear error when none exist."""
@@ -340,12 +393,21 @@ class MoomooBroker:
         return matching
 
     def _default_acc_id(self, trd_ctx, trd_env, moomoo) -> int:
-        """The first account id for ``trd_env``, regardless of market.
+        """A single account id for ``trd_env``, for callers that need just one.
 
-        Shared by the account/position readers, which span markets rather than
-        targeting a single symbol.
+        Prefers the first account whose ``trdmarket_auth`` covers a market in
+        ``_PREFERRED_MARKETS`` (US first — TradingAgents tickers are
+        Yahoo/US-centric by default); falls back to the very first account
+        when none of those markets match. A multi-market login often lists a
+        non-trading HK/CN cash account before the one actually in use, so
+        picking blindly (as this used to) can silently point ``get_account``'s
+        single cash figure at the wrong account.
         """
         matching = self._env_accounts(trd_ctx, trd_env, moomoo)
+        for market in _PREFERRED_MARKETS:
+            for _, row in matching.iterrows():
+                if market in (row.get("trdmarket_auth") or []):
+                    return int(row["acc_id"])
         return int(matching.iloc[0]["acc_id"])
 
     def _resolve_acc_id(self, trd_ctx, trd_env, moomoo, symbol) -> int:

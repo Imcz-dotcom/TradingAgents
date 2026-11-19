@@ -53,19 +53,39 @@ def fit_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> str:
 
 
 # The bot's messages (and the LLM's summaries) are written in Markdown-ish text:
-# **bold** section labels and `code` spans. Telegram renders neither by default,
-# so they used to show as literal asterisks/backticks on the phone. We convert
-# just those two forms to Telegram HTML (its most forgiving parse mode) and
-# escape everything else, falling back to plain text if Telegram still objects.
+# **bold** section labels, `code` spans, and ```fenced``` blocks (used for the
+# /auto verdict table, which needs real monospace alignment). Telegram renders
+# none of these by default, so they used to show as literal punctuation on the
+# phone. We convert just those forms to Telegram HTML (its most forgiving parse
+# mode) and escape everything else, falling back to plain text if Telegram
+# still objects. Fences are converted first so their own backticks don't get
+# mis-matched by the single-backtick `code` pattern afterward.
+_PRE_RE = re.compile(r"```(.*?)```", re.DOTALL)
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _CODE_RE = re.compile(r"`([^`\n]+)`")
 
 
 def to_telegram_html(text: str) -> str:
-    """Escape ``text`` for Telegram HTML, rendering **bold** and `code` spans."""
+    """Escape ``text`` for Telegram HTML, rendering **bold**, `code`, and
+    ```fenced``` blocks (the last as a real multi-line monospace ``<pre>``).
+
+    Fenced content is stashed out and restored untouched at the end — a `code`
+    span's own backticks appearing inside a fence (unlikely, but possible)
+    must not be re-matched by the single-backtick pattern on the second pass.
+    """
     escaped = html.escape(str(text), quote=False)
+    stashed: list[str] = []
+
+    def _stash(match: re.Match) -> str:
+        stashed.append(match.group(1))
+        return f"\x00PRE{len(stashed) - 1}\x00"
+
+    escaped = _PRE_RE.sub(_stash, escaped)
     escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
-    return _CODE_RE.sub(r"<code>\1</code>", escaped)
+    escaped = _CODE_RE.sub(r"<code>\1</code>", escaped)
+    for i, block in enumerate(stashed):
+        escaped = escaped.replace(f"\x00PRE{i}\x00", f"<pre>{block}</pre>")
+    return escaped
 
 
 def is_stop(text: str) -> bool:
@@ -76,6 +96,34 @@ def is_stop(text: str) -> bool:
     if word.startswith("/"):
         word = word[1:].lstrip()
     return word in STOP_WORDS
+
+
+class PendingApproval:
+    """One in-flight Approve/Reject prompt, resolved by whoever is polling.
+
+    Used by :meth:`TelegramNotifier.watch_for_cancel` and
+    :meth:`TelegramNotifier.ask_background_button` together so a long-running
+    background operation (``/auto`` on REAL) can ask for a tap *while its own
+    "stop" watcher is the only thing polling Telegram* — running a second,
+    independent poll concurrently would race on ``self._offset`` and could
+    silently drop updates (including the approval tap itself).
+    """
+
+    def __init__(self, buttons: list[tuple[str, str]], result: asyncio.Future):
+        self.buttons = buttons
+        self.result = result
+
+
+class ApprovalBox:
+    """Holds the currently pending :class:`PendingApproval`, or ``None``.
+
+    A plain mutable box (not a queue) because only one approval is ever asked
+    at a time — ``run_auto`` processes tickers one at a time, waiting for each
+    answer before moving on.
+    """
+
+    def __init__(self):
+        self.current: PendingApproval | None = None
 
 
 class TelegramNotifier:
@@ -260,14 +308,22 @@ class TelegramNotifier:
         with contextlib.suppress(Exception):
             await self.bot.answer_callback_query(query.id)
 
-    async def watch_for_cancel(self, cancelled: threading.Event) -> None:
-        """Poll for a "stop" while research runs; set ``cancelled`` when it lands.
+    async def watch_for_cancel(
+        self, cancelled: threading.Event, approvals: ApprovalBox | None = None
+    ) -> None:
+        """Poll for a "stop" while research (or ``/auto``) runs; set ``cancelled``.
 
-        ``cancelled`` is a ``threading.Event`` so the research worker thread can
-        also read it (via ``is_set``) and abort at its next phase boundary. This
-        is the loop that notices a stop typed while research runs, so the bot can
-        ack it immediately and abandon the run — instead of leaving the cancel
-        unread until the research finishes and then dropping it.
+        ``cancelled`` is a ``threading.Event`` so the worker thread can also
+        read it (via ``is_set``) and abort at its next boundary. This is the
+        loop that notices a stop typed mid-run, so the bot can ack it
+        immediately and abandon the run — instead of leaving the cancel unread
+        until the run finishes and then dropping it.
+
+        When ``approvals`` is given, this same loop also resolves whichever
+        :class:`PendingApproval` is currently in it — see
+        :meth:`ask_background_button`. A background operation needs exactly one
+        update poller; running ``ask_button``'s own poll concurrently with this
+        one would race on ``self._offset``.
         """
         from telegram.error import NetworkError
 
@@ -276,7 +332,7 @@ class TelegramNotifier:
                 updates = await self.bot.get_updates(
                     offset=self._offset,
                     timeout=5,
-                    allowed_updates=["message"],
+                    allowed_updates=["message", "callback_query"],
                 )
             except NetworkError:  # transient: keep watching; the task gets cancelled
                 await asyncio.sleep(1)
@@ -291,7 +347,52 @@ class TelegramNotifier:
                     and is_stop(msg.text)
                 ):
                     cancelled.set()
+                    pending = approvals.current if approvals else None
+                    if pending is not None and not pending.result.done():
+                        pending.result.set_result(STOP)
                     return
+                pending = approvals.current if approvals else None
+                if pending is None:
+                    continue
+                query = getattr(update, "callback_query", None)
+                if (
+                    query is not None
+                    and query.message is not None
+                    and query.message.chat_id == self.chat_id
+                    and query.data in {data for _, data in pending.buttons}
+                    and not pending.result.done()
+                ):
+                    await self._answer(query)
+                    pending.result.set_result(query.data)
+
+    async def ask_background_button(
+        self,
+        approvals: ApprovalBox,
+        prompt: str,
+        buttons: list[tuple[str, str]],
+        timeout_seconds: int,
+    ) -> str | None:
+        """Ask for a tap while a separate ``watch_for_cancel(_, approvals)`` task
+        is the one actually polling Telegram, returning the matching button's
+        callback data, ``STOP``, or ``None`` on timeout.
+
+        This does **not** poll itself (unlike :meth:`ask_button`) — it registers
+        a :class:`PendingApproval` in ``approvals`` and waits on its future,
+        which the watcher task resolves when a matching tap or a stop word
+        arrives. Used by ``/auto`` on REAL, where the watcher is already
+        running for the whole scan and a second independent poll would race it.
+        """
+        pending = PendingApproval(buttons=buttons, result=asyncio.get_event_loop().create_future())
+        approvals.current = pending
+        try:
+            await self.send(prompt, buttons=buttons)
+            try:
+                return await asyncio.wait_for(pending.result, timeout_seconds)
+            except asyncio.TimeoutError:
+                return None
+        finally:
+            if approvals.current is pending:
+                approvals.current = None
 
     async def _wait(self, predicate, timeout_seconds: int):
         """Poll for the first update ``predicate`` accepts, until the deadline."""

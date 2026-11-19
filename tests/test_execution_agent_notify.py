@@ -6,6 +6,8 @@ an extra, so button markup is built and asserted for real.
 """
 
 import asyncio
+import contextlib
+import threading
 
 import pytest
 
@@ -15,6 +17,7 @@ from execution_agent.notify import (
     SHARES,
     STOP,
     USD,
+    ApprovalBox,
     TelegramNotifier,
     is_stop,
     to_telegram_html,
@@ -57,6 +60,12 @@ class FakeBot:
 
     async def get_updates(self, offset=None, timeout=0, allowed_updates=None):
         self.allowed.append(allowed_updates)
+        # Real Telegram long-polls (suspends for real network I/O), so a
+        # watcher loop naturally yields to the event loop every iteration. An
+        # instantly-returning fake with an exhausted polls list would spin
+        # with zero suspension points, starving every other task on the loop
+        # (including the one meant to cancel it) — this keeps it cooperative.
+        await asyncio.sleep(0)
         return self.polls.pop(0) if self.polls else []
 
     async def answer_callback_query(self, callback_query_id):
@@ -136,6 +145,18 @@ def test_to_telegram_html_escapes_html():
 
 def test_to_telegram_html_plain_text_unchanged():
     assert to_telegram_html("just words") == "just words"
+
+
+def test_to_telegram_html_renders_fenced_block_as_pre():
+    assert (
+        to_telegram_html("```\nNVDA  Sell\nAAPL  Hold\n```")
+        == "<pre>\nNVDA  Sell\nAAPL  Hold\n</pre>"
+    )
+
+
+def test_to_telegram_html_fence_is_not_mangled_by_code_regex():
+    """The fence's own backticks mustn't leak through as stray <code> spans."""
+    assert to_telegram_html("```a`b`c```") == "<pre>a`b`c</pre>"
 
 
 def test_send_formats_as_html():
@@ -384,3 +405,76 @@ def test_send_renders_multi_row_buttons():
         [("❌ #1", "/cancel 1")],
         [("❌ #2", "/cancel 2")],
     ]
+
+
+# ---- ApprovalBox / watch_for_cancel resolving a pending approval -----------
+
+
+
+def test_watch_for_cancel_resolves_matching_callback():
+    """A background approval is resolved by the SAME poller watching for stop."""
+    bot = FakeBot(
+        polls=[[FakeUpdate(1, callback_query=FakeCallbackQuery("cq1", 111, APPROVE))]]
+    )
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+    approvals = ApprovalBox()
+
+    async def scenario():
+        cancelled = threading.Event()
+        watch_task = asyncio.create_task(notifier.watch_for_cancel(cancelled, approvals))
+        result = await notifier.ask_background_button(approvals, "Approve?", [("Y", APPROVE)], 5)
+        watch_task.cancel()  # the watcher keeps polling forever otherwise — real
+        with contextlib.suppress(asyncio.CancelledError):  # usage cancels it once
+            await watch_task                                # the whole /auto run ends
+        return result
+
+    result = _run(scenario())
+    assert result == APPROVE
+    assert bot.answered == ["cq1"]
+
+
+def test_watch_for_cancel_resolves_pending_approval_to_stop():
+    """A stop word while an approval is pending rejects it AND sets cancelled."""
+    bot = FakeBot(polls=[[FakeUpdate(1, message=FakeMessage(111, "stop"))]])
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+    approvals = ApprovalBox()
+
+    async def scenario():
+        cancelled = threading.Event()
+        watch_task = asyncio.create_task(notifier.watch_for_cancel(cancelled, approvals))
+        answer = await notifier.ask_background_button(approvals, "Approve?", [("Y", APPROVE)], 5)
+        await watch_task  # the watcher returns on its own once it sees the stop
+        return answer, cancelled.is_set()
+
+    answer, was_cancelled = _run(scenario())
+    assert answer == STOP
+    assert was_cancelled is True
+
+
+def test_ask_background_button_times_out_without_watcher():
+    bot = FakeBot(polls=[])
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+    approvals = ApprovalBox()
+
+    result = _run(notifier.ask_background_button(approvals, "Approve?", [("Y", APPROVE)], 0))
+
+    assert result is None
+    assert approvals.current is None  # cleared even after a timeout
+
+
+def test_watch_for_cancel_ignores_unrelated_callback_when_no_approval_pending():
+    """A stray callback with no pending approval must not crash the watcher."""
+    bot = FakeBot(
+        polls=[
+            [FakeUpdate(1, callback_query=FakeCallbackQuery("cq1", 111, "whatever"))],
+            [FakeUpdate(2, message=FakeMessage(111, "stop"))],
+        ]
+    )
+    notifier = TelegramNotifier("tok", 111, bot=bot)
+
+    async def scenario():
+        cancelled = threading.Event()
+        await notifier.watch_for_cancel(cancelled)
+        return cancelled.is_set()
+
+    assert _run(scenario()) is True

@@ -221,10 +221,11 @@ class FakeNotifier:
 
     instances = []
 
-    def __init__(self, token, chat_id, replies=("NVDA",)):
+    def __init__(self, token, chat_id, replies=("NVDA",), auto_approval=APPROVE):
         self.sent = []
         self.replies = list(replies)
         self.confirmations = []
+        self.auto_approval = auto_approval  # what ask_background_button returns
         FakeNotifier.instances.append(self)
 
     async def send(self, text, buttons=None):
@@ -233,7 +234,7 @@ class FakeNotifier:
     async def drain(self):
         pass
 
-    async def watch_for_cancel(self, cancelled):
+    async def watch_for_cancel(self, cancelled, approvals=None):
         # No stop arrives: block until cancelled, like the real watcher with no
         # incoming messages. (Returning immediately would read as "stop seen".)
         while True:
@@ -242,6 +243,14 @@ class FakeNotifier:
     async def ask_button(self, prompt, buttons, timeout_seconds):
         self.confirmations.append((prompt, [b for b, _ in buttons]))
         return APPROVE
+
+    async def ask_background_button(self, approvals, prompt, buttons, timeout_seconds):
+        # The real notifier resolves this from the SAME poll as watch_for_cancel
+        # (see notify.py); the fake just scripts the answer directly, since
+        # serve.py's /auto-on-REAL approval bridge is what's under test here,
+        # not notify.py's own polling mechanics (covered separately).
+        self.confirmations.append((prompt, [b for b, _ in buttons]))
+        return self.auto_approval
 
     async def ask_text(self, prompt, timeout_seconds):
         return "1000"
@@ -437,11 +446,52 @@ def test_serve_loop_chat_answers(monkeypatch, tmp_path):
     assert any("biggest risk is concentration" in s for s in ChatNotifier.instances[0].sent)
 
 
+def test_serve_loop_auto_drains_before_watching_for_stop(monkeypatch, tmp_path):
+    """A stale, never-consumed stop must not silently abort /auto on its own.
+
+    Regression for a real bug: a leftover stop-word sitting in Telegram's
+    queue (e.g. a bare "/cancel" typed long before, with nothing running to
+    catch it) was picked up by watch_for_cancel the instant /auto started,
+    aborting the run before a single ticker was researched — with no "stop"
+    sent that day. /auto must drain pending updates immediately before it
+    starts watching, so only a stop sent *after* it begins can abort it.
+    """
+    order = []
+
+    def fake_run_auto(config, *, budget=None, trading_env=None, audit=None, on_step=None, stop_check=None, quiet=False, approve=None):
+        order.append("run_auto")
+        return "📊 Auto done"
+
+    monkeypatch.setattr(serve_mod, "run_auto", fake_run_auto)
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class TrackingNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/auto",))
+
+        async def drain(self):
+            order.append("drain")
+
+        async def watch_for_cancel(self, cancelled, approvals=None):
+            order.append("watch")
+            while True:
+                await asyncio.sleep(1)
+
+    _wire(monkeypatch, tmp_path, TrackingNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    # A second drain (beyond the one-time startup drain) runs immediately
+    # before /auto starts watching for a fresh stop.
+    assert order == ["drain", "drain", "watch", "run_auto"]
+
+
 def test_serve_loop_auto_dispatches(monkeypatch, tmp_path):
     """/auto runs the autonomous loop with the current (paper) mode + budget."""
     calls = []
 
-    def fake_run_auto(config, *, budget=None, trading_env=None, audit=None, on_step=None, stop_check=None, quiet=False):
+    def fake_run_auto(config, *, budget=None, trading_env=None, audit=None, on_step=None, stop_check=None, quiet=False, approve=None):
         calls.append((budget, trading_env))
         return "📊 Auto done"
 
@@ -459,6 +509,95 @@ def test_serve_loop_auto_dispatches(monkeypatch, tmp_path):
 
     assert calls == [(500.0, "SIMULATE")]
     assert any("Auto done" in s for s in AutoNotifier.instances[0].sent)
+
+
+def test_serve_loop_auto_real_mode_asks_approval_per_trade(monkeypatch, tmp_path):
+    """On REAL, /auto's approve callback bridges to a real Telegram prompt."""
+    asked = []
+
+    def fake_run_auto(
+        config, *, budget=None, trading_env=None, audit=None, on_step=None,
+        stop_check=None, quiet=False, approve=None,
+    ):
+        assert trading_env == "REAL"
+        assert approve is not None  # REAL always gets a working bridge
+        asked.append(approve("NVDA", "BUY", 2.0, "LIMIT", 190.0))
+        return "📊 Auto done"
+
+    monkeypatch.setattr(serve_mod, "run_auto", fake_run_auto)
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class RealAutoNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(
+                token, chat_id, replies=("/mode real", "/auto"), auto_approval=APPROVE
+            )
+
+    _wire(monkeypatch, tmp_path, RealAutoNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert asked == [True]  # the bridge resolved to Approve
+    notifier = RealAutoNotifier.instances[0]
+    prompt, labels = notifier.confirmations[-1]
+    assert "NVDA" in prompt and "BUY" in prompt and "REAL" in prompt
+    assert labels == ["✅ Approve", "❌ Reject"]
+
+
+def test_serve_loop_auto_real_mode_rejected_trade_returns_false(monkeypatch, tmp_path):
+    asked = []
+
+    def fake_run_auto(
+        config, *, budget=None, trading_env=None, audit=None, on_step=None,
+        stop_check=None, quiet=False, approve=None,
+    ):
+        asked.append(approve("NVDA", "BUY", 2.0, "LIMIT", 190.0))
+        return "📊 Auto done"
+
+    monkeypatch.setattr(serve_mod, "run_auto", fake_run_auto)
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class RejectingAutoNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            from execution_agent.notify import REJECT
+
+            super().__init__(
+                token, chat_id, replies=("/mode real", "/auto"), auto_approval=REJECT
+            )
+
+    _wire(monkeypatch, tmp_path, RejectingAutoNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert asked == [False]
+
+
+def test_serve_loop_auto_paper_mode_gets_no_approve_callback(monkeypatch, tmp_path):
+    """Paper mode must never even build an approval bridge."""
+    received = []
+
+    def fake_run_auto(
+        config, *, budget=None, trading_env=None, audit=None, on_step=None,
+        stop_check=None, quiet=False, approve=None,
+    ):
+        received.append(approve)
+        return "📊 Auto done"
+
+    monkeypatch.setattr(serve_mod, "run_auto", fake_run_auto)
+    monkeypatch.setattr(serve_mod, "approve_and_place", lambda *a, **k: "unused")
+
+    class PaperAutoNotifier(FakeNotifier):
+        def __init__(self, token, chat_id):
+            super().__init__(token, chat_id, replies=("/auto",))
+
+    _wire(monkeypatch, tmp_path, PaperAutoNotifier)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(serve_mod.serve_loop(_config()))
+
+    assert received == [None]
 
 
 def test_serve_loop_chat_without_research_nudges(monkeypatch, tmp_path):
@@ -930,6 +1069,63 @@ def test_fill_messages_cancelled_is_not_a_fill():
     messages, _ = serve_mod._fill_messages({1: "SUBMITTED"}, [_order(1, "CANCELLED_ALL")])
 
     assert messages == []
+
+
+# ---- bracket cleanup (no native OCO — the sibling gets cancelled in software) --
+
+
+def test_bracket_pairs_builds_bidirectional_map():
+    plan = {"plan": [{"ticker": "NVDA", "bracket": {"stop_order_id": 1, "target_order_id": 2}}]}
+
+    assert serve_mod._bracket_pairs(plan) == {1: 2, 2: 1}
+
+
+def test_bracket_pairs_skips_incomplete_brackets():
+    plan = {"plan": [
+        {"ticker": "NEW", "bracket": {"stop_order_id": None, "target_order_id": None}},
+        {"ticker": "OLD", "bracket": None},
+        {"ticker": "LEGACY"},  # no bracket key at all — pre-feature plan entry
+    ]}
+
+    assert serve_mod._bracket_pairs(plan) == {}
+
+
+def test_bracket_pairs_handles_missing_plan():
+    assert serve_mod._bracket_pairs(None) == {}
+    assert serve_mod._bracket_pairs({}) == {}
+
+
+def test_bracket_cancellations_stop_fills_cancels_target():
+    pairs = {1: 2, 2: 1}  # 1=stop, 2=target
+
+    cancels = serve_mod._bracket_cancellations(pairs, [_order(1, "FILLED_ALL"), _order(2, "SUBMITTED")])
+
+    assert cancels == [2]
+
+
+def test_bracket_cancellations_target_fills_cancels_stop():
+    pairs = {1: 2, 2: 1}
+
+    cancels = serve_mod._bracket_cancellations(pairs, [_order(1, "SUBMITTED"), _order(2, "FILLED_ALL")])
+
+    assert cancels == [1]
+
+
+def test_bracket_cancellations_neither_filled_is_quiet():
+    pairs = {1: 2, 2: 1}
+
+    assert serve_mod._bracket_cancellations(pairs, [_order(1, "SUBMITTED"), _order(2, "SUBMITTED")]) == []
+
+
+def test_bracket_cancellations_no_tracked_bracket_is_quiet():
+    """An order with no bracket on record (e.g. a plain /execute fill) is ignored."""
+    assert serve_mod._bracket_cancellations({}, [_order(1, "FILLED_ALL")]) == []
+
+
+def test_bracket_cancellations_both_already_filled_is_quiet():
+    pairs = {1: 2, 2: 1}
+
+    assert serve_mod._bracket_cancellations(pairs, [_order(1, "FILLED_ALL"), _order(2, "FILLED_ALL")]) == []
 
 
 def test_schedule_due_fires_once_after_time():

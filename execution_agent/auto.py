@@ -1,11 +1,23 @@
-"""Fully-automatic paper-trading loop behind the ``/auto`` command.
+"""Fully-automatic paper-OR-approved-live trading loop behind ``/auto``.
 
 ``/auto`` is the opposite of the human-in-the-loop flow: it reads the account,
 researches every ticker in the universe (the watchlist plus current holdings),
-decides buy/sell on its own, and places the orders — **paper only**. It follows
-the research's own price levels: buy at the trader's entry price, sell at the
-portfolio manager's price target, as NORMAL (limit) orders, falling back to
-MARKET when a level is absent or absurd.
+and decides buy/sell on its own. It follows the research's own price levels:
+buy at the trader's entry price, sell at the portfolio manager's price target,
+as NORMAL (limit) orders, falling back to MARKET when a level is absent or
+absurd.
+
+On paper (``SIMULATE``) every decided trade is placed immediately, exactly as
+before — there is nothing to approve when no real money moves. On ``REAL``,
+placing an order autonomously would mean the bot spends real money with no
+human in the loop at all, which is a different risk than every other trading
+path in this agent (even ``/execute`` always stops for a tap). So on REAL,
+each trade /auto wants to place is instead sent to Telegram as an
+Approve/Reject prompt (via the ``approve`` callback) and only placed if
+approved; a timeout or Reject skips that trade, same as everywhere else in
+this agent ("timeout = reject, never a silent yes"). Protective stop-losses and
+cancelling a superseded resting order are not re-approved — they only reduce
+risk on a position the human already approved into.
 
 Money is a *budget*, not a per-trade size. ``/auto 500`` means "I have $500 of
 new money today": the loop splits that budget across the buy ideas by the
@@ -21,19 +33,19 @@ stale date, it re-researches. Every decision and order is appended to the audit
 trail (``execution_agent/state.py``).
 
 The loop is synchronous (research and broker calls block), so the serve bot runs
-it in a worker thread and passes ``on_step`` (progress) and ``stop_check``
-(cancellation) to stay responsive and abort on a "stop".
+it in a worker thread and passes ``on_step`` (progress), ``stop_check``
+(cancellation), and on REAL, ``approve`` (per-trade approval) to stay
+responsive and abort on a "stop".
 """
 
 from __future__ import annotations
 
 import math
-import re
 from datetime import date
 
 from execution_agent import auto_plan, persist, state, watchlist
 from execution_agent.broker import MoomooBroker
-from execution_agent.config import ExecutionConfig
+from execution_agent.config import ExecutionConfig, mode_label
 from execution_agent.decision import run_decision_streaming
 from execution_agent.prices import parse_prices, parse_time_horizon, time_in_force_for
 from tradingagents.agents.rating import is_review
@@ -75,6 +87,59 @@ def conviction_weight(signal: str) -> float:
     return _BUY_WEIGHT.get(signal, 0.0)
 
 
+# A Hold-pullback buy is deliberately a weaker claim than even an Overweight —
+# it's not the LLM's own conviction, it's an execution-layer overlay the user
+# opted into. If a genuine Buy/Overweight is competing for the same budget,
+# that gets priority.
+HOLD_PULLBACK_WEIGHT = 0.5
+
+
+def is_hold_pullback_candidate(decision, prices: dict, book: PortfolioContext, live: float | None) -> bool:
+    """Whether a Hold-rated ticker qualifies for the opt-in pullback buy.
+
+    Requires: the rating is exactly Hold (not REVIEW — ``decision.side`` is
+    None for both), the ticker isn't currently held (Hold on an existing
+    position means "keep it", not "buy more" — the bracket already protects
+    it), the trader gave an entry price, and that price is genuinely *below*
+    the live price. A pullback level at or above the live price would fill
+    like a market order immediately — the opposite of "wait for it to come
+    down" — so that's treated as unusable, same as no level at all.
+    """
+    if decision.side is not None or is_review(decision.signal):
+        return False
+    position = book.position_in(decision.yahoo)
+    if position is not None and position.quantity > 0:
+        return False
+    entry = prices.get("entry_price")
+    return entry is not None and entry > 0 and live is not None and live > 0 and entry < live
+
+
+def hold_pullback_action(prices: dict, live: float | None, notional: float | None, time_in_force: str) -> dict:
+    """The action for an opted-in Hold-pullback buy: always a LIMIT at the
+    trader's entry price, sized off that entry price (not the live price,
+    since the order won't fill at live) — never a MARKET fallback, since
+    buying right now at the live price defeats the entire point of waiting
+    for a pullback.
+
+    Pure — no broker, network, or I/O. Caller must already have confirmed
+    :func:`is_hold_pullback_candidate`; this only guards budget/sizing.
+    """
+    entry = prices["entry_price"]
+    if not notional or notional <= 0:
+        return {"side": "BUY", "quantity": 0.0, "order_type": None, "limit_price": None, "reason": "no_budget"}
+    qty = float(math.floor(notional / entry))
+    if qty <= 0:  # budget too small to buy even one share at the pullback level
+        return {"side": "BUY", "quantity": 0.0, "order_type": None, "limit_price": None, "reason": "no_price"}
+    return {
+        "side": "BUY",
+        "quantity": qty,
+        "order_type": "LIMIT",
+        "limit_price": entry,
+        "time_in_force": time_in_force,
+        "reason": "ok",
+    }
+
+
 def trim_quantity(signal: str, position_quantity: float, trim: float) -> float:
     """Shares to sell for a rating: full exit for ``Sell``, ``trim`` of the
     position for ``Underweight`` (floored to whole units).
@@ -96,6 +161,46 @@ def allocate_budget(buys: list[tuple[str, float]], budget: float | None) -> dict
     if total <= 0:
         return {}
     return {ticker: budget * w / total for ticker, w in buys if w > 0}
+
+
+def position_qty_after(book: PortfolioContext, yahoo: str, action: dict, executed) -> float:
+    """The held quantity still needing a bracket, after this run's own action.
+
+    A MARKET order fills synchronously (paper), so a BUY changes the position
+    immediately. A SELL (full exit or trim), whether it fills now (MARKET) or
+    rests (LIMIT), already has its own order chasing ``price_target`` for that
+    quantity — those shares must NOT also get wrapped in a bracket's take-profit,
+    or the same shares would have two competing sell orders. So a successful
+    SELL always subtracts its quantity, filled or not; only a BUY's effect is
+    conditional on actually having filled (a pending LIMIT buy has nothing to
+    protect yet — the bracket waits for a later run once it fills).
+    """
+    position = book.position_in(yahoo)
+    starting = position.quantity if position else 0.0
+    if action["side"] == "SELL" and action["reason"] == "ok":
+        return max(0.0, starting - action["quantity"])
+    if action["side"] == "BUY" and executed is not None and action["order_type"] == "MARKET":
+        return starting + action["quantity"]
+    return starting
+
+
+def plan_bracket(new_qty: float, prices: dict) -> dict:
+    """The stop/target orders to place for ``new_qty`` shares, or ``None`` for
+    a side the research never gave a usable level for. Pure — no I/O.
+
+    ``new_qty <= 0`` means nothing is held — no bracket to place at all.
+    """
+    if new_qty <= 0:
+        return {"stop": None, "target": None}
+    stop = (
+        {"price": prices["stop_loss"], "quantity": new_qty}
+        if prices.get("stop_loss") is not None else None
+    )
+    target = (
+        {"price": prices["price_target"], "quantity": new_qty}
+        if prices.get("price_target") is not None else None
+    )
+    return {"stop": stop, "target": target}
 
 
 def decide_action(
@@ -127,9 +232,23 @@ def decide_action(
         if position is None or position.quantity <= 0:
             return {"side": "SELL", "quantity": 0.0, "order_type": None, "limit_price": None, "reason": "no_position"}
         qty = trim_quantity(decision.signal, position.quantity, config.auto_underweight_trim)
-        if qty <= 0:  # an Underweight trim that floors to zero units
-            return {"side": "SELL", "quantity": 0.0, "order_type": None, "limit_price": None, "reason": "no_position"}
+        if qty <= 0:
+            # An Underweight trim floored to zero units (e.g. a fractional
+            # dust position too small to meaningfully trim) — the position is
+            # still genuinely held, so this must not report "no_position"
+            # ("Not worth" — you don't own this), which the bracket-ensure
+            # step (Pass 4) still runs for regardless, protecting it exactly
+            # like any other held Hold-rated ticker.
+            return {"side": "SELL", "quantity": 0.0, "order_type": None, "limit_price": None, "reason": "hold"}
         limit = sane_limit(prices["price_target"], live, config.limit_price_band)
+        if limit is None and live is not None and live > 0:
+            # No usable target (missing, or too far from live to trust) — a
+            # raw MARKET order would accept *any* price, including a crashed
+            # or illiquid print far below where the stock is actually
+            # trading. Protect with a marketable limit near the live price
+            # instead: it still fills almost immediately in normal
+            # conditions, but won't fill into a bad tail print.
+            limit = round(live * (1 - config.auto_market_sell_buffer), 2)
         order_type = "LIMIT" if limit is not None else "MARKET"
         return {
             "side": "SELL",
@@ -160,61 +279,93 @@ def decide_action(
     }
 
 
-def _short_why(summary) -> str:
-    """The decision's executive summary, trimmed to one short reason line.
+def verdict(entry: dict) -> str:
+    """One of: ``Buy``, ``Sell``, ``Hold``, ``Not worth``, ``Buy @ X``,
+    ``Sell @ X``, ``Buy @ X?``, ``Sell @ X?`` — or ``Error``. The reasoning
+    behind any of these lives in the research itself; ask ``/chat`` for it,
+    this is deliberately just the call.
 
-    A flat book renders an "avoid" call as a one-liner; this pulls just the
-    portfolio manager's opening summary (rating's reasoning) so the message says
-    *why* the ticker was skipped rather than "sell called" against nothing.
+    A bare ``Buy``/``Sell`` means the order already executed (a MARKET fill).
+    ``Buy @ X``/``Sell @ X`` (no ``?``) means a real resting LIMIT order is
+    sitting on the broker *right now* — Moomoo fires it automatically the
+    instant price reaches ``X``, nothing further needed from you. ``Buy @
+    X?``/``Sell @ X?`` (with the ``?``) means **nothing is set anywhere** —
+    it's only the price that *would* trigger a buy/sell if you gave `/auto` a
+    budget, a live price becomes available, or you approve it on REAL — the
+    ``?`` is the signal that this one still needs something from you.
     """
-    if not summary:
-        return ""
-    m = re.search(r"\*\*Executive Summary\*\*:\s*(.+)", str(summary), re.DOTALL)
-    if not m:
-        return ""
-    text = m.group(1)
-    cutoff = re.search(r"\*\*Investment Thesis\*\*", text)
-    if cutoff:
-        text = text[: cutoff.start()]
-    text = " ".join(text.split())
-    return text if len(text) <= 120 else text[:120].rstrip() + "…"
-
-
-def _entry_line(entry: dict) -> str:
-    """One plan entry as a single Telegram line."""
-    ticker = entry["ticker"]
-    reason = entry["reason"]
+    reason, side = entry["reason"], entry.get("side")
     if reason == "ok":
-        qty = f"{entry['quantity']:g}"
-        if entry["order_type"] == "LIMIT" and entry["limit_price"] is not None:
-            tif = entry.get("time_in_force") or "DAY"
-            kind = f"LIMIT {tif} @ {entry['limit_price']:g}"
-        else:
-            kind = "MARKET"
-        order = entry["executed"] or {}
-        oid = order.get("order_id", "?")
-        alloc = ""
-        if entry.get("side") == "BUY" and entry.get("notional"):
-            alloc = f" ~${entry['notional']:,.0f}"
-        return f"✅ {ticker}: {entry['side']} {qty} ({kind}){alloc} — order {oid}"
+        label = "Buy" if side == "BUY" else "Sell"
+        if entry.get("order_type") == "MARKET":
+            return label
+        price = entry.get("limit_price")
+        return f"{label} @ {price:g}" if price is not None else label
     if reason == "hold":
-        return f"➖ {ticker}: hold — no action"
+        return "Hold"
     if reason == "review":
-        return f"⚠️ {ticker}: REVIEW — skipped"
+        return "Review"
     if reason == "no_position":
-        signal = entry.get("signal") or "avoid"
-        why = _short_why(entry.get("summary"))
-        return f"➖ {ticker}: {signal} — no position to act on" + (f" · {why}" if why else "")
-    if reason == "no_budget":
-        return f"➖ {ticker}: buy called but no budget — skipped"
-    if reason == "no_price":
-        return f"⚠️ {ticker}: no usable price/size — skipped"
-    return f"⚠️ {ticker}: {reason}"
+        return "Not worth"
+    if reason in ("no_budget", "no_price"):
+        price = entry.get("entry_price")
+        return f"Buy @ {price:g}?" if price is not None else "Buy?"
+    if reason == "not_approved":
+        label = "Buy" if side == "BUY" else "Sell"
+        price = entry.get("limit_price")
+        return f"{label} @ {price:g}?" if price is not None else f"{label}?"
+    return "Error"
+
+
+def levels_hint(entry: dict) -> str:
+    """The price levels relevant alongside a verdict — what "hold till" or
+    "re-entry at" actually means, as real numbers.
+
+    A ticker carrying a bracket (any position actually held — freshly bought,
+    or a Hold-rated holding backfilled with one) shows the stop/target it's
+    literally being protected and exited by — that's the direct answer to
+    "hold till what price". A ticker with no position (``Not worth``) falls
+    back to the research's own target as a re-entry reference. A ``Hold`` on
+    a ticker you don't hold at all has no exit level to show, so it falls
+    back one step further to the trader's entry price — a watch level, not
+    an order. ``-`` only when none of this exists, which is normal: not every
+    research run produces a usable target or entry (see /chat for why).
+    """
+    bracket = entry.get("bracket") or {}
+    parts = []
+    if bracket.get("stop_price") is not None:
+        parts.append(f"stop {bracket['stop_price']:g}")
+    if bracket.get("target_price") is not None:
+        parts.append(f"target {bracket['target_price']:g}")
+    if parts:
+        return " / ".join(parts)
+    if entry.get("price_target") is not None:
+        return f"target {entry['price_target']:g}"
+    if entry["reason"] == "hold" and entry.get("entry_price") is not None:
+        return f"watch {entry['entry_price']:g}"
+    return "-"
+
+
+def verdict_table(plan: list[dict]) -> str:
+    """The whole day's calls as one compact, aligned monospace table."""
+    rows = [(e["ticker"], verdict(e), levels_hint(e)) for e in plan]
+    if not rows:
+        return ""
+    ticker_w = max(len("Ticker"), *(len(t) for t, _, _ in rows))
+    verdict_w = max(len("Verdict"), *(len(v) for _, v, _ in rows))
+    lines = [
+        f"{'Ticker'.ljust(ticker_w)}  {'Verdict'.ljust(verdict_w)}  Levels",
+        f"{'-' * ticker_w}  {'-' * verdict_w}  {'-' * len('Levels')}",
+    ]
+    lines.extend(f"{t.ljust(ticker_w)}  {v.ljust(verdict_w)}  {lv}" for t, v, lv in rows)
+    return "```\n" + "\n".join(lines) + "\n```"
 
 
 def _summarize(day: dict) -> str:
-    """The human summary of a stored plan (budget + cash + positions + lines)."""
-    lines = [f"📊 Auto paper scan — {day.get('date')}"]
+    """The human summary of a stored plan: budget + cash + positions + a
+    terse Buy/Sell/Hold/Not-worth table. Ask ``/chat`` for the reasoning."""
+    mode = mode_label(day.get("trading_env") or "SIMULATE")
+    lines = [f"📊 Auto scan — {mode} — {day.get('date')}"]
     currency = day.get("currency")
     budget = day.get("budget")
     if budget:
@@ -233,7 +384,10 @@ def _summarize(day: dict) -> str:
     plan = day.get("plan") or []
     if plan:
         lines.append("")
-        lines.extend(_entry_line(e) for e in plan)
+        lines.append(verdict_table(plan))
+        if any("?" in verdict(e) for e in plan):
+            lines.append("`?` = not set yet — needs a budget, a live price, or your approval.")
+        lines.append("`/chat <ticker> ...` for the reasoning behind any call.")
     return "\n".join(lines)
 
 
@@ -246,21 +400,30 @@ def run_auto(
     on_step=None,
     stop_check=None,
     quiet: bool = False,
+    approve=None,
 ) -> str:
     """Run the whole auto loop once and return a one-message summary.
 
     ``budget`` is the dollars of *new* money to deploy today (``None`` means
     manage-only: sell/trim/hold, no new buys). ``trading_env`` overrides
     ``config.trading_env`` (the serve bot lets the user switch paper/live at
-    runtime); /auto is paper-only and refuses anything else. ``on_step(label)``
-    receives progress; ``stop_check() -> bool`` aborts the loop at the next
-    boundary when True. ``audit`` is the audit-log path (skipped when None).
+    runtime). ``on_step(label)`` receives progress; ``stop_check() -> bool``
+    aborts the loop at the next boundary when True. ``audit`` is the audit-log
+    path (skipped when None).
+
+    ``approve`` matters only on ``trading_env == "REAL"``: a sync callable
+    ``approve(ticker, side, quantity, order_type, limit_price) -> bool`` asked
+    before *every* trade /auto wants to place, mirroring "timeout = reject"
+    everywhere else in this agent. On REAL with no ``approve`` given, every
+    trade is treated as unapproved (fails safe — never silently trades real
+    money unsupervised); on SIMULATE, ``approve`` is never called and every
+    decided trade places immediately, exactly as before.
 
     Progress is deliberately terse: one line per ticker, never the pipeline's
     per-phase chatter (a 6-ticker scan would otherwise send ~50 messages).
     ``quiet=True`` (the scheduled daily run) suppresses even the per-ticker
     lines — only *serious* events reach the phone: orders placed, stop-losses,
-    cancellations, and errors, plus the final summary.
+    cancellations, errors, REAL approval prompts, and the final summary.
     """
     trading_env = trading_env or config.trading_env
 
@@ -273,8 +436,6 @@ def run_auto(
         """Orders, stops, errors — always worth a message, even when quiet."""
         if on_step is not None:
             on_step(label)
-    if trading_env != "SIMULATE":
-        return "🔒 /auto is paper-only — it refuses to run in 🔴 REAL mode. Use `/mode paper` first."
 
     today = date.today().isoformat()
 
@@ -309,32 +470,27 @@ def run_auto(
             seen.add(key)
             full_universe.append(ticker)
 
-    # Refer-back: a same-day plan is reused rather than re-researched — but not
-    # blindly. The watchlist may have grown, or an earlier (pre-sharing) run may
-    # have saved a ticker to the plan without reaching the /chat store. So the
-    # tickers already held in the shared store are skipped; the rest (a new
-    # watchlist entry, or a plan ticker missing from the store) are researched
-    # now and folded into today's plan. A ticker that *errored* today is also
-    # skipped — re-running a failing pipeline on every same-day /auto would burn
-    # tokens for the same failure; a fresh day retries it naturally.
+    # Refer-back: same-day research is reused, never re-paid for — but every
+    # held ticker still goes through Pass 2/3 (decide + bracket-ensure) on
+    # every run, cheaply, via the same-day cache inside the loop below. Only a
+    # ticker that *errored* today is held back entirely — retrying a failing
+    # pipeline on every same-day /auto would burn tokens for the same failure;
+    # a fresh day retries it naturally.
     stored = auto_plan.load_plan()
     carried_plan: list[dict] = []
     if isinstance(stored, dict) and stored.get("date") == today:
-        shared = persist.load_history() or {}
-        shared_symbols = {str(k).upper() for k in (shared.get("researches") or {})}
         failed_today = {
             str(e.get("ticker") or "").upper()
             for e in (stored.get("plan") or [])
             if e.get("reason") == "error"
         }
-        skip = shared_symbols | failed_today
-        to_research = [t for t in full_universe if t.upper() not in skip]
+        to_research = [t for t in full_universe if t.upper() not in failed_today]
         carried_plan = [
             e for e in (stored.get("plan") or [])
-            if str(e.get("ticker") or "").upper() in skip
+            if str(e.get("ticker") or "").upper() in failed_today
         ]
         if not to_research:
-            return "📚 Already ran /auto today — nothing new to research (watchlist unchanged):\n\n" + _summarize(stored)
+            return "📚 Already ran /auto today — every ticker already failed once (watchlist unchanged):\n\n" + _summarize(stored)
     else:
         to_research = full_universe
 
@@ -343,7 +499,7 @@ def run_auto(
 
     def _stop_and_save() -> str:
         persist.save_auto_researches([c["decision"] for c in candidates])
-        day = _make_day(today, acct, book, full_universe, plan_entries, budget)
+        day = _make_day(today, acct, book, full_universe, plan_entries, budget, trading_env)
         auto_plan.save_plan(day)
         return "🛑 Stopped during /auto — partial plan saved, no further orders.\n\n" + _summarize(day)
 
@@ -391,7 +547,15 @@ def run_auto(
             _progress(f"📚 Auto: reusing today's research on {decision.yahoo}")
 
         prices = parse_prices(decision.research)
-        live = _live_price(broker, decision.moomoo) if decision.side is not None else None
+        # A live quote is normally only needed for an actionable side — but a
+        # Hold with an entry price also needs one, to check the pullback is
+        # genuinely below the live price, when the user opted into that.
+        wants_live = decision.side is not None or (
+            config.auto_buy_hold_pullback
+            and decision.signal == "Hold"
+            and prices.get("entry_price") is not None
+        )
+        live = _live_price(broker, decision.moomoo) if wants_live else None
         horizon = parse_time_horizon(decision.research)
         candidates.append({"decision": decision, "prices": prices, "live": live, "horizon": horizon})
 
@@ -405,6 +569,12 @@ def run_auto(
         for c in candidates
         if c["decision"].side == "BUY"
     ]
+    pullback_tickers: set[str] = set()
+    if config.auto_buy_hold_pullback:
+        for c in candidates:
+            if is_hold_pullback_candidate(c["decision"], c["prices"], book, c["live"]):
+                buys.append((c["decision"].yahoo, HOLD_PULLBACK_WEIGHT))
+                pullback_tickers.add(c["decision"].yahoo)
     notional = allocate_budget(buys, budget)
 
     for c in candidates:
@@ -426,11 +596,32 @@ def run_auto(
             if audit:
                 state.append_event(audit, {"event": "auto_error", "ticker": decision.yahoo, "message": f"cancel stale: {exc}"})
 
-        slice_ = notional.get(decision.yahoo) if decision.side == "BUY" else None
-        action = decide_action(
-            decision, prices, book, config, c["live"],
-            notional=slice_, time_in_force=time_in_force_for(c["horizon"]),
-        )
+        is_pullback = decision.yahoo in pullback_tickers
+        slice_ = notional.get(decision.yahoo) if (decision.side == "BUY" or is_pullback) else None
+        if is_pullback:
+            action = hold_pullback_action(
+                prices, c["live"], slice_, time_in_force_for(c["horizon"]),
+            )
+        else:
+            action = decide_action(
+                decision, prices, book, config, c["live"],
+                notional=slice_, time_in_force=time_in_force_for(c["horizon"]),
+            )
+
+        # REAL money: every trade needs an explicit tap before it's placed —
+        # /auto's whole point is to decide *without* approval, which is only
+        # safe to let loose on paper. No approve callable given on REAL fails
+        # safe (treated as rejected), never as a silent approval.
+        if trading_env == "REAL" and action["reason"] == "ok" and action["quantity"] > 0:
+            approved = bool(
+                approve
+                and approve(
+                    decision.yahoo, action["side"], action["quantity"],
+                    action["order_type"], action["limit_price"],
+                )
+            )
+            if not approved:
+                action = {**action, "reason": "not_approved"}
 
         if audit:
             state.append_event(
@@ -444,9 +635,8 @@ def run_auto(
                 },
             )
 
-        # Pass 3 — place the order (limit/market) and a protective stop-loss.
+        # Pass 3 — place the order (limit/market).
         executed = None
-        stop_order = None
         if action["reason"] == "ok" and action["quantity"] > 0:
             try:
                 result = broker.place_order(
@@ -460,39 +650,66 @@ def run_auto(
                         audit,
                         {"event": "order", "ticker": decision.yahoo, "side": action["side"], **result},
                     )
-                # A protective stop-loss is only meaningful once the position
-                # exists. A MARKET buy fills immediately (paper), so place the
-                # stop right after it; a pending LIMIT buy has nothing to protect
-                # yet, so the stop level is recorded in the plan for a later run.
-                if (
-                    action["side"] == "BUY"
-                    and action["order_type"] == "MARKET"
-                    and prices["stop_loss"] is not None
-                ):
-                    try:
-                        stop_result = broker.place_order(
-                            decision.moomoo, "SELL", action["quantity"],
-                            order_type="STOP", price=prices["stop_loss"], time_in_force="GTC",
-                        )
-                        stop_order = {"order_id": stop_result["order_id"], "order_status": stop_result["order_status"]}
-                        _serious(f"🛡️ Auto: stop-loss on {decision.yahoo} @ {prices['stop_loss']:g} — order {stop_order['order_id']}")
-                        if audit:
-                            state.append_event(
-                                audit,
-                                {"event": "order", "ticker": decision.yahoo, "side": "SELL",
-                                 "order_type": "STOP", **stop_result},
-                            )
-                    except Exception as exc:  # noqa: BLE001 — stop rejected; record, don't fail the entry
-                        stop_order = None
-                        if audit:
-                            state.append_event(
-                                audit, {"event": "auto_error", "ticker": decision.yahoo, "message": f"stop-loss: {exc}"}
-                            )
             except Exception as exc:  # noqa: BLE001 — a rejected order is recorded, not fatal
                 executed = None
                 action["reason"] = "error"
                 if audit:
                     state.append_event(audit, {"event": "auto_error", "ticker": decision.yahoo, "message": str(exc)})
+
+        # Pass 4 — the protective bracket (stop-loss + take-profit). Runs for
+        # EVERY candidate, not just ones bought this run, so an existing
+        # holding (bought via /execute, or from before this existed) gets
+        # covered too — this is deliberate, not a side effect. Never gated by
+        # approval: it only manages risk on a position already held, never
+        # takes on new exposure, same reasoning as the old single-case stop.
+        new_qty = position_qty_after(book, decision.yahoo, action, executed)
+        bracket = {"stop_order_id": None, "target_order_id": None, "quantity": new_qty,
+                   "stop_price": None, "target_price": None}
+        try:
+            for existing in broker.list_orders(decision.moomoo, open_only=True):
+                if existing["order_type"] == "STOP" and existing["side"] == "SELL":
+                    broker.cancel_order(existing["order_id"])
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup; still try to place fresh orders
+            if audit:
+                state.append_event(audit, {"event": "auto_error", "ticker": decision.yahoo, "message": f"bracket cleanup: {exc}"})
+
+        plan = plan_bracket(new_qty, prices)
+        if plan["stop"] is not None:
+            try:
+                stop_result = broker.place_order(
+                    decision.moomoo, "SELL", plan["stop"]["quantity"],
+                    order_type="STOP", price=plan["stop"]["price"], time_in_force="GTC",
+                )
+                bracket["stop_order_id"] = stop_result["order_id"]
+                bracket["stop_price"] = plan["stop"]["price"]
+                _serious(f"🛡️ Auto: stop-loss on {decision.yahoo} @ {plan['stop']['price']:g} — order {stop_result['order_id']}")
+                if audit:
+                    state.append_event(
+                        audit,
+                        {"event": "order", "ticker": decision.yahoo, "side": "SELL",
+                         "order_type": "STOP", **stop_result},
+                    )
+            except Exception as exc:  # noqa: BLE001 — stop rejected; record, don't fail the entry
+                if audit:
+                    state.append_event(audit, {"event": "auto_error", "ticker": decision.yahoo, "message": f"stop-loss: {exc}"})
+        if plan["target"] is not None:
+            try:
+                target_result = broker.place_order(
+                    decision.moomoo, "SELL", plan["target"]["quantity"],
+                    price=plan["target"]["price"], time_in_force="GTC",
+                )
+                bracket["target_order_id"] = target_result["order_id"]
+                bracket["target_price"] = plan["target"]["price"]
+                _serious(f"🎯 Auto: take-profit on {decision.yahoo} @ {plan['target']['price']:g} — order {target_result['order_id']}")
+                if audit:
+                    state.append_event(
+                        audit,
+                        {"event": "order", "ticker": decision.yahoo, "side": "SELL",
+                         "order_type": "NORMAL", **target_result},
+                    )
+            except Exception as exc:  # noqa: BLE001 — target rejected; record, don't fail the entry
+                if audit:
+                    state.append_event(audit, {"event": "auto_error", "ticker": decision.yahoo, "message": f"take-profit: {exc}"})
 
         plan_entries.append(
             {
@@ -502,8 +719,13 @@ def run_auto(
                 "quantity": action["quantity"],
                 "order_type": action["order_type"],
                 "limit_price": action["limit_price"],
-                "notional": slice_ if decision.side == "BUY" else None,
-                "weight": conviction_weight(decision.signal) if decision.side == "BUY" else None,
+                "notional": slice_ if (decision.side == "BUY" or is_pullback) else None,
+                "weight": (
+                    HOLD_PULLBACK_WEIGHT if is_pullback
+                    else conviction_weight(decision.signal) if decision.side == "BUY"
+                    else None
+                ),
+                "pullback": is_pullback,
                 "entry_price": prices["entry_price"],
                 "stop_loss": prices["stop_loss"],
                 "price_target": prices["price_target"],
@@ -511,20 +733,24 @@ def run_auto(
                 "time_in_force": action.get("time_in_force"),
                 "summary": decision.summary,
                 "executed": executed,
-                "stop_order": stop_order,
+                "bracket": bracket,
                 "reason": action["reason"],
             }
         )
 
-    day = _make_day(today, acct, book, full_universe, plan_entries, budget)
+    day = _make_day(today, acct, book, full_universe, plan_entries, budget, trading_env)
     auto_plan.save_plan(day)
     return _summarize(day)
 
 
-def _make_day(today: str, acct: dict, book: PortfolioContext, universe: list[str], plan_entries: list[dict], budget: float | None) -> dict:
+def _make_day(
+    today: str, acct: dict, book: PortfolioContext, universe: list[str],
+    plan_entries: list[dict], budget: float | None, trading_env: str = "SIMULATE",
+) -> dict:
     """Assemble the persisted day document."""
     return {
         "date": today,
+        "trading_env": trading_env,
         "budget": budget,
         "cash": acct.get("cash"),
         "currency": acct.get("currency"),

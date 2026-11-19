@@ -169,3 +169,28 @@ def test_auto_schedule_budget_rejects_negative():
 def test_chat_history_turns_rejects_non_positive():
     with pytest.raises(ValueError):
         ExecutionConfig(chat_history_turns=0)
+
+
+def test_auto_buy_hold_pullback_defaults_off():
+    assert ExecutionConfig().auto_buy_hold_pullback is False
+
+
+def test_auto_buy_hold_pullback_env_override(isolated_env):
+    isolated_env.setenv("EXECUTION_AGENT_AUTO_BUY_HOLD_PULLBACK", "true")
+    assert ExecutionConfig.from_env().auto_buy_hold_pullback is True
+
+
+def test_auto_market_sell_buffer_default():
+    assert ExecutionConfig().auto_market_sell_buffer == 0.02
+
+
+def test_auto_market_sell_buffer_rejects_out_of_range():
+    with pytest.raises(ValueError):
+        ExecutionConfig(auto_market_sell_buffer=1.0)
+    with pytest.raises(ValueError):
+        ExecutionConfig(auto_market_sell_buffer=-0.01)
+
+
+def test_auto_market_sell_buffer_zero_is_allowed():
+    """0 means "use the raw live price" — still a LIMIT, just with no buffer."""
+    ExecutionConfig(auto_market_sell_buffer=0.0)

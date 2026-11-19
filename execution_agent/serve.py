@@ -34,7 +34,7 @@ from execution_agent.broker import OPEN_STATUSES, MoomooBroker
 from execution_agent.config import ExecutionConfig, mode_label
 from execution_agent.decision import DecisionResult, parse_amount, run_decision_streaming
 from execution_agent.main import TELEGRAM_MAX_CHARS, _fit_telegram, approve_and_place
-from execution_agent.notify import APPROVE, REJECT, SHARES, TelegramNotifier, is_stop
+from execution_agent.notify import APPROVE, REJECT, SHARES, ApprovalBox, TelegramNotifier, is_stop
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -96,7 +96,8 @@ HELP_TEXT = (
     "`NVDA` or `/research NVDA` — research a ticker (add `fresh` to force a re-run)\n"
     "`/execute [ticker]` — trade a researched ticker (I'll ask amount + approval)\n"
     "`/chat [ticker] <question>` — ask me about today's research\n"
-    "`/auto` — manage the account: sell/trim/hold per the analysis (paper only)\n"
+    "`/auto` — manage the account: sell/trim/hold per the analysis. On paper it "
+    "trades instantly; on REAL, each trade asks you to Approve/Reject first\n"
     "`/auto 500` — same, plus deploy $500 across the buy ideas by conviction\n"
     "`/status` — cash, positions with P/L, open orders, today's research\n"
     "`/orders` — open orders, with tap-to-cancel buttons\n"
@@ -238,6 +239,37 @@ def _fill_messages(prev: dict[int, str], orders: list[dict]) -> tuple[list[str],
                 f"🎉 Order filled: {order['side']} {order['quantity']:g} {order['symbol']}{price}"
             )
     return messages, current
+
+
+def _bracket_pairs(plan: dict | None) -> dict[int, int]:
+    """order_id -> sibling order_id, from every bracket in today's /auto plan.
+
+    Moomoo has no native one-cancels-other order — ``/auto`` places a stop and
+    a take-profit as two independent resting orders, so once one fills the
+    other is a stale leftover pointing at shares no longer held. This builds
+    the lookup the fill-watcher needs to find and cancel that leftover.
+    """
+    pairs: dict[int, int] = {}
+    for entry in (plan or {}).get("plan") or []:
+        bracket = entry.get("bracket") or {}
+        stop_id, target_id = bracket.get("stop_order_id"), bracket.get("target_order_id")
+        if stop_id is not None and target_id is not None:
+            pairs[stop_id] = target_id
+            pairs[target_id] = stop_id
+    return pairs
+
+
+def _bracket_cancellations(bracket_pairs: dict[int, int], orders: list[dict]) -> list[int]:
+    """Sibling order ids to cancel because their bracket partner just filled.
+
+    Pure — no I/O — so the fill-watcher's cleanup logic unit-tests without a
+    broker. ``bracket_pairs`` is bidirectional (see :func:`_bracket_pairs`).
+    """
+    filled = {o["order_id"] for o in orders if o["order_status"] == "FILLED_ALL"}
+    return [
+        sibling for oid, sibling in bracket_pairs.items()
+        if oid in filled and sibling not in filled
+    ]
 
 
 def _schedule_due(
@@ -529,6 +561,13 @@ async def serve_loop(config: ExecutionConfig) -> None:
             # Telegram and sets ``stopped`` the moment a stop lands, and the
             # research itself checks ``stopped`` between phases so it aborts at
             # the next phase boundary instead of running the full pipeline.
+            #
+            # Drain first: a leftover, never-consumed stop-word (e.g. a bare
+            # "/cancel" typed ages ago with nothing running to catch it) would
+            # otherwise still be sitting in Telegram's queue and abort THIS run
+            # the instant the watcher starts — before a single phase completes.
+            with contextlib.suppress(Exception):
+                await notifier.drain()
             stopped = threading.Event()
             watch = asyncio.create_task(notifier.watch_for_cancel(stopped))
             await asyncio.sleep(0)  # let the watcher start polling before research begins
@@ -676,7 +715,13 @@ async def serve_loop(config: ExecutionConfig) -> None:
         # The scheduled (quiet) run announces nothing — the summary is enough.
         if not quiet:
             try:
-                if budget:
+                if mode == "REAL":
+                    await notifier.send(
+                        "🤖 /auto (🔴 REAL) — I'll research the watchlist + holdings and "
+                        "decide buy/sell myself, but on real money every trade still "
+                        "needs your Approve tap before it's placed."
+                    )
+                elif budget:
                     await notifier.send(
                         f"🤖 /auto — deploying ${budget:g} today: I'll research the "
                         "watchlist + holdings and split it across the buys by conviction."
@@ -692,9 +737,52 @@ async def serve_loop(config: ExecutionConfig) -> None:
 
         # Same stop/race pattern as research: run the loop in a worker thread so
         # the event loop stays free, and a "stop" aborts it at the next boundary.
+        # ``approvals`` lets watch_for_cancel's SAME poll also resolve a REAL-mode
+        # trade approval — running ask_button's own poll concurrently with the
+        # watcher would race on the notifier's update offset (see notify.py).
+        #
+        # Drain first: a leftover, never-consumed stop-word (e.g. a bare
+        # "/cancel" typed ages ago with nothing running to catch it) would
+        # otherwise still be sitting in Telegram's queue and abort /auto before
+        # it researches a single ticker — without you ever sending "stop" today.
+        with contextlib.suppress(Exception):
+            await notifier.drain()
         stopped = threading.Event()
-        watch = asyncio.create_task(notifier.watch_for_cancel(stopped))
+        approvals = ApprovalBox()
+        watch = asyncio.create_task(notifier.watch_for_cancel(stopped, approvals))
         await asyncio.sleep(0)  # let the watcher start polling before /auto begins
+
+        approve_sync = None
+        if mode == "REAL":
+
+            def approve_sync(ticker, side, quantity, order_type, limit_price):
+                """Called from /auto's worker thread; blocks for a Telegram tap.
+
+                Bridges to the event loop via run_coroutine_threadsafe — the
+                actual Telegram poll happens in the ``watch`` task above, not
+                here, via the shared ``approvals`` box.
+                """
+                kind = (
+                    f"LIMIT @ {limit_price:g}" if order_type == "LIMIT" and limit_price
+                    else order_type or "MARKET"
+                )
+                prompt = (
+                    f"🔴 REAL — /auto wants to {side} {quantity:g} {ticker} ({kind}).\n"
+                    "Approve or Reject?"
+                )
+                future = asyncio.run_coroutine_threadsafe(
+                    notifier.ask_background_button(
+                        approvals, prompt,
+                        [("✅ Approve", APPROVE), ("❌ Reject", REJECT)],
+                        config.approval_timeout_seconds,
+                    ),
+                    loop,
+                )
+                try:
+                    return future.result() == APPROVE
+                except Exception:  # noqa: BLE001 — a failed ask must never read as approved
+                    return False
+
         runner = asyncio.create_task(
             asyncio.to_thread(
                 run_auto,
@@ -705,6 +793,7 @@ async def serve_loop(config: ExecutionConfig) -> None:
                 on_step=_on_step,
                 stop_check=stopped.is_set,
                 quiet=quiet,
+                approve=approve_sync,
             )
         )
         try:
@@ -842,6 +931,25 @@ async def serve_loop(config: ExecutionConfig) -> None:
                 state.append_event(audit, {"event": "fill", "message": message})
                 with contextlib.suppress(Exception):
                     await notifier.send(message)
+
+            # Bracket cleanup — Moomoo has no native OCO, so when a stop or
+            # take-profit fills, its sibling is a stale order pointing at
+            # shares no longer held. Cancel it and say so.
+            pairs = _bracket_pairs(auto_plan.load_plan())
+            for order_id in _bracket_cancellations(pairs, orders):
+                sibling = next((o for o in orders if o["order_id"] == order_id), None)
+                try:
+                    await asyncio.to_thread(_broker().cancel_order, order_id)
+                except Exception as exc:  # noqa: BLE001 — best-effort; log and move on
+                    state.append_event(audit, {"event": "auto_error", "message": f"bracket cancel {order_id}: {exc}"})
+                    continue
+                state.append_event(audit, {"event": "bracket_cancel", "order_id": order_id})
+                if sibling is not None:
+                    kind = "stop-loss" if sibling["order_type"] == "STOP" else "take-profit"
+                    with contextlib.suppress(Exception):
+                        await notifier.send(
+                            f"🎯 {sibling['symbol']} bracket hit — cancelled the now-stale {kind} (order {order_id})."
+                        )
 
     while True:
         # The idle wait wakes periodically so the background checks (schedule,

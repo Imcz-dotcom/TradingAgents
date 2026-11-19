@@ -80,6 +80,19 @@ class ExecutionConfig:
     # /chat: how many past Q&A turns are replayed into the prompt. Caps token
     # cost — the research transcript dominates anyway, and old turns go stale.
     chat_history_turns: int = 8
+    # Opt-in: /auto also places a low-conviction resting LIMIT buy at the
+    # trader's entry price for a Hold-rated ticker it doesn't hold, when that
+    # entry is genuinely below the live price (a pullback level). Off by
+    # default — a Hold rating means "don't buy" until you explicitly ask for
+    # this; see execution_agent/auto.py's hold_pullback_action.
+    auto_buy_hold_pullback: bool = False
+    # A Sell/Underweight exit with no usable price_target (missing, or too far
+    # from the live price per limit_price_band) no longer accepts any price
+    # via a raw MARKET order — it places a LIMIT this fraction below the live
+    # price instead, so a bad/illiquid print can't fill it far below where the
+    # stock is actually trading. Still fills almost immediately in normal
+    # conditions; only protects the tail case.
+    auto_market_sell_buffer: float = 0.02
 
     def __post_init__(self) -> None:
         self.validate()
@@ -108,6 +121,10 @@ class ExecutionConfig:
         if self.chat_history_turns <= 0:
             raise ValueError(
                 f"chat_history_turns must be positive, got {self.chat_history_turns!r}"
+            )
+        if not 0 <= self.auto_market_sell_buffer < 1:
+            raise ValueError(
+                f"auto_market_sell_buffer must be in [0, 1), got {self.auto_market_sell_buffer!r}"
             )
         if self.side_mapping is not None:
             self.parsed_side_mapping()  # raises on invalid JSON / shape
